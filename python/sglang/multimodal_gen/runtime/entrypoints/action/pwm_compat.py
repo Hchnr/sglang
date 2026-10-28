@@ -24,11 +24,11 @@ from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
     lower_pwm_wam_request,
     numpy_to_lists,
     pwm_wam_response_metadata,
+    pwm_wam_video_response,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_pwm_wam.request import (
     validate_request,
 )
-from starlette.responses import FileResponse
 
 
 def create_app(generator, *, output_dir: str | Path = "outputs/pwm-wam") -> FastAPI:
@@ -95,12 +95,11 @@ def create_app(generator, *, output_dir: str | Path = "outputs/pwm-wam") -> Fast
         if not re.fullmatch(r"[0-9a-f]{32}\.mp4", filename):
             raise HTTPException(status_code=404, detail="Output not found")
         try:
-            path = store.resolve(filename.removesuffix(".mp4"))
+            return pwm_wam_video_response(store, filename.removesuffix(".mp4"))
         except KeyError as exc:
             raise HTTPException(
                 status_code=404, detail="Output expired or not found"
             ) from exc
-        return FileResponse(path, media_type="video/mp4", filename=filename)
 
     @app.delete("/outputs/{filename}")
     def delete_output(filename: str):

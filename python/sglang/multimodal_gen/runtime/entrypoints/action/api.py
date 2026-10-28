@@ -10,7 +10,6 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import FileResponse
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_pwm_wam import (
     CosmosPWMWAMPipelineConfig,
@@ -280,13 +279,16 @@ def _wam_video_store(request: Request):
 
 @router.get("/videos/{video_id}/content")
 async def action_video_content(video_id: str, request: Request):
+    from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
+        pwm_wam_video_response,
+    )
+
     try:
-        path = _wam_video_store(request).resolve(video_id)
+        return pwm_wam_video_response(_wam_video_store(request), video_id)
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail="Video expired or not found"
         ) from exc
-    return FileResponse(path, media_type="video/mp4", filename=f"{video_id}.mp4")
 
 
 @router.delete("/videos/{video_id}")

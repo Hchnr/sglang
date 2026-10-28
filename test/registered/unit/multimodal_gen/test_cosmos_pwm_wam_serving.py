@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """WAM registry and joint action/video protocol bookkeeping, without model weights."""
 
+import asyncio
 import copy
 import json
 import tempfile
@@ -27,10 +28,12 @@ from sglang.multimodal_gen.runtime.entrypoints.action import api, protocol
 from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
     ActionVideoStore,
     lower_pwm_wam_request,
+    pwm_wam_video_response,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from starlette.requests import ClientDisconnect
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -186,6 +189,10 @@ class TestCosmosPWMWAMServing(CustomTestCase):
                     lower_pwm_wam_request(payload)
         with self.assertRaisesRegex(ValueError, "inside wam_request"):
             lower_pwm_wam_request({"wam_request": self.raw, "seed": 19})
+        with self.assertRaisesRegex(ValueError, "envelope fields"):
+            lower_pwm_wam_request({"input": {}, "parameters": {}, "n": 2})
+        with self.assertRaisesRegex(ValueError, "supplied twice"):
+            lower_pwm_wam_request({"input": {"seed": 17}, "parameters": {"seed": 19}})
         self.assertEqual(
             lower_pwm_wam_request(
                 {
@@ -217,6 +224,7 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             "seed": 17,
             "contract_fingerprint": "unit-contract",
             "checkpoint_config_sha256": "unit-config-digest",
+            "asset_file_sha256": {"vae/config.json": "unit-vae-digest"},
             "loader_info": {"mode": "strict", "tensor_count": 12},
             "video_frames": np.zeros((33, 32, 32, 3), dtype=np.uint8),
             "video_fps": 15,
@@ -247,6 +255,10 @@ class TestCosmosPWMWAMServing(CustomTestCase):
                 data["action128"]["checkpoint_config_sha256"], "unit-config-digest"
             )
             self.assertEqual(data["action128"]["loader_info"]["tensor_count"], 12)
+            self.assertEqual(
+                data["action128"]["asset_file_sha256"]["vae/config.json"],
+                "unit-vae-digest",
+            )
             self.assertEqual(data["action128"]["normalized_actions"][0], [0.0] * 128)
             self.assertEqual(data["video"]["shape"], [33, 32, 32, 3])
             self.assertEqual(client.get(data["video"]["url"]).content, b"unit-mp4")
@@ -319,6 +331,70 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             )
             self.assertEqual(client.get("/outputs/config.json").status_code, 404)
         self.assertFalse(app.state.pwm_wam_video_store.directory.exists())
+
+    def test_video_download_survives_deletion_and_closes_on_disconnect(self):
+        """An admitted download owns its file even after the URL is deleted."""
+        app = FastAPI()
+        app.state.server_args = self.server_args
+        store = ActionVideoStore(self.root / "downloads")
+        self.addCleanup(store.close)
+        app.state.pwm_wam_video_store = store
+        app.include_router(api.router)
+        content = b"video-bytes" * 20000
+
+        def encode(path, _frames, **_kwargs):
+            Path(path).write_bytes(content)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.entrypoints.utils._save_video_ffmpeg",
+                encode,
+            ),
+            TestClient(app) as client,
+        ):
+            video = store.save_output(
+                {"video_frames": np.zeros((1, 2, 2, 3), np.uint8), "video_fps": 20}
+            )["video"]
+            response = pwm_wam_video_response(store, video["id"])
+            received = bytearray()
+
+            async def receive():
+                return {"type": "http.request"}
+
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    if not received:
+                        store.delete(video["id"])
+                        self.assertEqual(client.get(video["url"]).status_code, 404)
+                    received.extend(message.get("body", b""))
+
+            scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+            asyncio.run(response(scope, receive, send))
+            self.assertEqual(received, content)
+            self.assertTrue(response._stream.closed)
+
+            # Cancellation before even starting the body must close the handle.
+            video = store.save_output(
+                {"video_frames": np.zeros((1, 2, 2, 3), np.uint8), "video_fps": 20}
+            )["video"]
+            response = pwm_wam_video_response(store, video["id"])
+
+            async def disconnect(_message):
+                raise asyncio.CancelledError
+
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(response(scope, receive, disconnect))
+            self.assertTrue(response._stream.closed)
+
+            response = pwm_wam_video_response(store, video["id"])
+
+            async def broken_send(message):
+                if message["type"] == "http.response.body":
+                    raise OSError("client socket closed during download")
+
+            with self.assertRaises(ClientDisconnect):
+                asyncio.run(response(scope, receive, broken_send))
+            self.assertTrue(response._stream.closed)
 
     def test_other_wam_pipelines_keep_their_existing_action_schema(self):
         """The common WAM mode name does not opt other models into Action128."""

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import tempfile
 import time
 import uuid
@@ -17,6 +18,8 @@ import numpy as np
 from sglang.multimodal_gen.configs.sample.cosmos_pwm_wam import (
     CosmosPWMWAMSamplingParams,
 )
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
 
 
 def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -54,6 +57,16 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
     if "model_mode" in payload:
         return copy.deepcopy(payload)
 
+    unknown = set(payload) - {
+        "input",
+        "parameters",
+        "runtime",
+        "model",
+        "id",
+        "request_id",
+    }
+    if unknown:
+        raise ValueError(f"Unsupported WAM envelope fields: {sorted(unknown)}")
     inputs = payload.get("input", {})
     parameters = payload.get("parameters", {})
     if not isinstance(inputs, dict) or not isinstance(parameters, dict):
@@ -61,15 +74,20 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
     observation = inputs.get("observation", {})
     if not isinstance(observation, dict):
         raise TypeError("WAM observation must be an object")
-    options = {
-        **{
+    options = {}
+    for source in (
+        {
             key: value
             for key, value in inputs.items()
             if key not in ("observation", "task")
         },
-        **observation,
-        **parameters,
-    }
+        observation,
+        parameters,
+    ):
+        duplicate = options.keys() & source.keys()
+        if duplicate:
+            raise ValueError(f"WAM fields supplied twice: {sorted(duplicate)}")
+        options.update(source)
     mode = options.pop("action_mode", "wam")
     if mode != "wam":
         raise ValueError("Cosmos PWM WAM requires action_mode='wam'")
@@ -161,6 +179,7 @@ def pwm_wam_response_metadata(output: dict[str, Any], *, preserve_numpy=False) -
             "timing_seconds",
             "checkpoint_path",
             "checkpoint_config_sha256",
+            "asset_file_sha256",
             "loader_info",
         )
         if name in output
@@ -180,6 +199,46 @@ def numpy_to_lists(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [numpy_to_lists(item) for item in value]
     return value
+
+
+class _VideoDownloadResponse(StreamingResponse):
+    """Own an already-open video through normal completion or client disconnect."""
+
+    def __init__(self, stream, filename: str):
+        self._stream = stream
+
+        async def chunks():
+            try:
+                while chunk := await run_in_threadpool(stream.read, 64 * 1024):
+                    yield chunk
+            finally:
+                stream.close()
+
+        super().__init__(
+            chunks(),
+            media_type="video/mp4",
+            headers={
+                "content-length": str(os.fstat(stream.fileno()).st_size),
+                "content-disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    async def __call__(self, scope, receive, send):
+        # StreamingResponse does not run background tasks if send raises. The
+        # response also owns closure when the iterator never starts or is paused.
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._stream.close()
+
+
+def pwm_wam_video_response(store: ActionVideoStore, video_id: str):
+    stream = store.open(video_id)
+    try:
+        return _VideoDownloadResponse(stream, f"{video_id}.mp4")
+    except BaseException:
+        stream.close()
+        raise
 
 
 class ActionVideoStore:
@@ -264,6 +323,11 @@ class ActionVideoStore:
             if video_id not in self._entries:
                 raise KeyError(video_id)
             return self._entries[video_id][0]
+
+    def open(self, video_id: str):
+        """Acquire a read handle before deletion/eviction can unlink the path."""
+        with self._lock:
+            return self.resolve(video_id).open("rb")
 
     def delete(self, video_id: str) -> None:
         with self._lock:

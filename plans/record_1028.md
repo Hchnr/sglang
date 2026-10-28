@@ -94,3 +94,11 @@ GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5
 - 最终审查补启动资产/配置 guards，避免错误 VAE/tokenizer、改变的推理配置或越界 projection ID 静默进入 GPU；资产配置 hash 不等同于完整权重绑定。
 - 视频下载用锁内打开的句柄，避免下载与 DELETE/过期清理竞态；正常发送、未开始 body 即取消、ASGI send 异常均验证句柄关闭，已打开后删除仍能读完，新 GET 返回 404。服务 CPU 更新为 9/9。
 - 最后 GPU 矩阵、最终 HTTP 与同卡 SGLang benchmark 进行中；当前结论仍明确保留跨 Torch/cuDNN 的 VAE e2e 差异。
+
+## 2026-10-28 18:08：最终矩阵与下载生命周期验证
+
+- 诊断工具提交 `9a2a260afe`。最终 Python/worker 矩阵七次请求全部成功，覆盖 smoke、原尺寸 Libero、Droid 独立频率/CFG norm、Robotwin 非连续 mask、Robocasa 单相机、缺省 30 steps 和 Libero 重放。跨 domain/shape/seed 后 Libero 的 actions、normalized actions、uint8 视频仍逐元素一致；证据 `final_python_matrix/summary.json`。
+- 最终原生服务按 README CLI 启动成功：wrapper、标准 action envelope、raw JSON 三种输入动作一致；非法 wrapper seed、runtime.cuda_graph、顶层 n 均返回 400；开关视频不改变动作。真实视频下载/删除/404 通过，保留视频后 SIGTERM 确认文件和临时目录都清理。
+- 下载生命周期修复单独提交：锁内打开句柄，DELETE/过期清理不会使已开始的下载失效；ASGI 正常完成、发送异常及 body 尚未启动时取消都关闭句柄。9 项 serving CPU 测试通过，最终 native HTTP 重测通过。兼容接口最终复测仍在进行。
+- 独立验证环境 `.venv` 的核心包安装在本仓库；`pwm_validation_base.pth` 只读追加相邻环境的第三方 site-packages（包括 msgspec/FastAPI/uvicorn），不包含 Cosmos/vLLM 仓库代码。`environment.json` 记录主要包实际位置，补充 `environment_all_packages.json` 记录完整首选 distribution 版本/路径。这不是干净容器全量安装的验证，保留这一环境边界。
+- 共享 NFS 使最后几个进程的 Python import/spawn 明显变慢；此时间与 GPU 请求延迟分开记录，不作为模型性能结论。
