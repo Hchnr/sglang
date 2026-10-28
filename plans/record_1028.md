@@ -63,3 +63,23 @@
 - 真实 SGLang Python worker、native HTTP 与兼容 HTTP 正在分别验证，不将内核 runtime 成功当作服务接入完成。
 
 实现与验证尚未完成。每阶段补充改动、命令/结果、失败原因、修正、提交和剩余风险。
+
+## 2026-10-28 17:40：真实服务、矩阵与差异定位
+
+- 接线提交 `39dc0c1c49`。真实 `DiffGenerator`/worker 与直接 runtime 的动作、normalized actions、uint8 视频逐元素一致；第二次请求 Python end-to-end 0.329 s、worker 0.318 s。
+- 原生 HTTP 与 Cosmos facade：动作/normalized actions 完全一致，视频 MP4 逐字节一致；开关视频动作不变，下载/删除/404 通过。原生错误 400 与 facade 错误 422 后均恢复；facade 四个并发请求为 200/503/503/503，返回 Retry-After=1，之后合法请求恢复。
+- 真实退出发现原生 HTTP 临时目录残留，补 action router lifespan 显式清理并验证目录删除；Pi05 API 10 项再次通过。补 wrapper 忽略外层采样字段的拒绝规则，避免静默吞参数。
+- 更新后的 runtime CPU 13/13 通过，覆盖局部 SDPA 状态在正常/异常路径恢复、严格字段/布局校验与 provenance；新部署文档 `examples/diffusion/cosmos_pwm_wam/README.md` 已写，CLI 参数经真实解析验证，最后服务重测使用相同命令。
+- 原尺寸 Libero（960×640、40 actions/41 frames）、Droid（50 Hz actions/15 FPS、100 actions）、Robotwin joint 非连续 mask、单相机 Robocasa 均原生跑通；A/B/C/D/A 的 actions、normalized actions、视频首尾逐元素一致。每个请求当前 Cosmos reference 也已生成。首轮跨环境误差保存在 `matrix_comparison_before_sdpa_fix.json`，不作为最终通过结果。
+
+### 决策 D05：修正模型局部 attention 默认值
+
+SGLang `runtime/platforms/cuda.py` 导入会禁用 cuDNN SDPA，改变了 source SDPA 的算法选择。冻结同层输入和权重后，纯 native core 在 Torch 2.10 和 2.14 的默认 all-backend SDPA 下均与 source 精确一致；使用 SGLang 默认时出现偏差。现在仅在 WAM forward 作用域启用四种 SDPA backend，结束/异常后恢复原状态，不修改全平台默认。该修正令 UND layer 0/35 与 source 精确一致。
+
+VAE 仍有独立偏差：pixels、首卷积、norm1、SiLU 相同，首次分歧出现在早期 residual conv1；正在核对卷积算法/库版本与 layout。C 使用 cuDNN 9.15.1.9、S 为 9.24.0.43。benchmark=True 不能消除差异，因此未据此改生产设置。
+
+### 决策 D06：保留同卡、同请求基线并避开外部作业
+
+GPU0 后续出现本 namespace 不可见的外部 PID 329992，占约 45 GB，不操作它。主验证转 GPU2，分层诊断 GPU1、HTTP GPU3。
+
+GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5、无视频解码，metadata reuse 开启）：六次请求排除首轮后，SDPA median 3.430 s；FA3+compile median 2.233 s，首次 21.835 s 含编译。等待最终 SGLang 同卡测量；不宣称接入即提速。基线日志与响应位于 `artifacts/pwm_wam_1028/benchmark/`。

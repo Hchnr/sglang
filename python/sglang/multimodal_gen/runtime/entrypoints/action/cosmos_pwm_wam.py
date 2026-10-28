@@ -41,6 +41,12 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
         if runtime.get(name) not in (None, False, "false"):
             raise ValueError(f"Cosmos PWM WAM does not support runtime.{name}")
     if "wam_request" in payload:
+        unknown = set(payload) - {"wam_request", "runtime", "model", "id", "request_id"}
+        if unknown:
+            raise ValueError(
+                "Sampling fields belong inside wam_request; unsupported wrapper "
+                f"fields: {sorted(unknown)}"
+            )
         raw = payload["wam_request"]
         if not isinstance(raw, dict):
             raise ValueError("wam_request must be an object")
@@ -153,6 +159,9 @@ def pwm_wam_response_metadata(output: dict[str, Any], *, preserve_numpy=False) -
             "contract_fingerprint",
             "conditioning_caption_sha256",
             "timing_seconds",
+            "checkpoint_path",
+            "checkpoint_config_sha256",
+            "loader_info",
         )
         if name in output
     }

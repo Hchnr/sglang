@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Adapted from vllm-omni-pwm d3e9aad33e861b69be16c4f341695e1cc12b3314.
 """The Action128 WAM request contract, shared by Python and HTTP execution.
 
 Adapted from the native PWM implementation in vLLM-Omni. Media materialization
@@ -47,7 +48,7 @@ class PwmRequest(msgspec.Struct, kw_only=True):
     return_video: bool
 
 
-def canvas_seam(roles, layout, height, width):
+def canvas_seam(roles, layout, height=None, width=None):
     if (
         not isinstance(roles, list)
         or not 1 <= len(roles) <= 3
@@ -68,6 +69,10 @@ def canvas_seam(roles, layout, height, width):
             raise ValueError("Invalid camera_layout role or location")
         if any(type(x) is not int or x <= 0 for x in item[2:]):
             raise ValueError("Camera dimensions must be positive integer pixels")
+    # Admission validates declared geometry without reading remote media.
+    # Materialization also checks the declaration against the decoded pixels.
+    height = layout[0][3] + layout[1][3] if height is None else height
+    width = layout[0][2] if width is None else width
     seam = layout[0][3]
     if layout[0][2] != width or not 0 < seam < height:
         raise ValueError("Top camera does not match canvas")
@@ -157,11 +162,75 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
     """
     if not isinstance(raw, dict):
         raise ValueError("WAM request must be an object")
+    fixed_defaults = {
+        "duration_template": "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS.",
+        "resolution_template": "This video is of {height}x{width} resolution.",
+        "inverse_duration_template": "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS.",
+        "inverse_resolution_template": "This video is not of {height}x{width} resolution.",
+        "negative_metadata_mode": "none",
+        "negative_prompt_keep_metadata": True,
+        "aspect_ratio": "16,9",
+        "video_save_quality": 10,
+        "image_save_quality": 95,
+    }
+    supported = {
+        "model_mode",
+        "model",
+        "name",
+        "domain_name",
+        "output_dir",
+        "extra",
+        "prompt",
+        "prompt_path",
+        "negative_prompt",
+        "vision_path",
+        "seed",
+        "num_steps",
+        "guidance",
+        "shift",
+        "guidance_interval",
+        "normalize_cfg",
+        "fps",
+        "action_chunk_size",
+        "num_frames",
+        "image_size",
+        "num_outputs",
+        "n",
+        "num_outputs_per_prompt",
+        "raw_action_dim",
+        "sampler",
+        "sigma_max",
+        "condition_frame_indexes_vision",
+        "condition_frame_indexes_action",
+        "action_path",
+        "state_path",
+        "robot_state",
+        "tensors_file",
+        "pickle_file",
+        "autoregressive",
+        "enable_sound",
+        "native_prompt_upsampling",
+        "prompt_upsampling",
+        "skip_text_tokens_for_cfg",
+        "defaults_file",
+        "enable_cuda_graph",
+        "enable_breakable_cuda_graph",
+        "enable_prefix_cache",
+        "enable_torch_compile",
+    } | fixed_defaults.keys()
+    unknown = set(raw) - supported
+    if unknown:
+        raise ValueError(f"Unsupported WAM request fields: {sorted(unknown)}")
+    for name, default in fixed_defaults.items():
+        if raw.get(name) is not None and raw[name] != default:
+            raise ValueError(f"Native WAM requires the default {name}={default!r}")
     for field in (
         "action_path",
         "state_path",
         "robot_state",
         "condition_frame_indexes_action",
+        "tensors_file",
+        "pickle_file",
     ):
         if raw.get(field) not in (None, []):
             raise ValueError(f"Native no-state WAM does not accept {field}")
@@ -173,6 +242,10 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
         "native_prompt_upsampling",
         "prompt_upsampling",
         "skip_text_tokens_for_cfg",
+        "enable_cuda_graph",
+        "enable_breakable_cuda_graph",
+        "enable_prefix_cache",
+        "enable_torch_compile",
     ):
         if raw.get(flag):
             raise ValueError(f"Native WAM does not support {flag}")
@@ -184,7 +257,10 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
         raise ValueError("Custom sigma_max requires EDM; native WAM uses UniPC")
     if raw.get("defaults_file") is not None:
         raise ValueError("Apply defaults_file values to the request before submission")
-    if raw.get("num_outputs") not in (None, 1) or raw.get("raw_action_dim") not in (
+    if any(
+        raw.get(name) not in (None, 1)
+        for name in ("num_outputs", "n", "num_outputs_per_prompt")
+    ) or raw.get("raw_action_dim") not in (
         None,
         128,
     ):
@@ -326,6 +402,7 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
         raise ValueError("Single-camera layout must be null")
     if len(roles) > 1 and (not isinstance(layout, list) or len(layout) != len(roles)):
         raise ValueError("camera_layout must match selected_roles")
+    canvas_seam(roles, layout)
     raw.update(
         vision_path=str(vision_path),
         prompt=prompt,

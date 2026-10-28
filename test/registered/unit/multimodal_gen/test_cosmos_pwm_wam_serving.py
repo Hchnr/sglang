@@ -174,6 +174,29 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             with self.subTest(parameters=parameters), self.assertRaises(ValueError):
                 lower_pwm_wam_request({"parameters": parameters})
 
+    def test_raw_wrappers_cannot_hide_unsupported_runtime_or_sampling_fields(self):
+        for wrapped in (False, True):
+            for field in ("cuda_graph", "prefix_cache"):
+                payload = {"wam_request": self.raw} if wrapped else dict(self.raw)
+                payload["runtime"] = {field: True}
+                with (
+                    self.subTest(wrapped=wrapped, field=field),
+                    self.assertRaisesRegex(ValueError, f"runtime.{field}"),
+                ):
+                    lower_pwm_wam_request(payload)
+        with self.assertRaisesRegex(ValueError, "inside wam_request"):
+            lower_pwm_wam_request({"wam_request": self.raw, "seed": 19})
+        self.assertEqual(
+            lower_pwm_wam_request(
+                {
+                    "wam_request": self.raw,
+                    "request_id": "client-request",
+                    "runtime": {"response_format": "raw", "prefix_cache": False},
+                }
+            ),
+            self.raw,
+        )
+
     def test_http_retains_action128_metadata_and_downloadable_joint_video(self):
         """JSON serialization must retain normalized values and same-rollout video."""
         app = FastAPI()
@@ -193,6 +216,8 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             "action_units": "source",
             "seed": 17,
             "contract_fingerprint": "unit-contract",
+            "checkpoint_config_sha256": "unit-config-digest",
+            "loader_info": {"mode": "strict", "tensor_count": 12},
             "video_frames": np.zeros((33, 32, 32, 3), dtype=np.uint8),
             "video_fps": 15,
         }
@@ -218,6 +243,10 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             data = response.json()["data"][0]
             self.assertEqual(data["action"]["shape"], [100, 128])
             self.assertEqual(data["action128"]["seed"], 17)
+            self.assertEqual(
+                data["action128"]["checkpoint_config_sha256"], "unit-config-digest"
+            )
+            self.assertEqual(data["action128"]["loader_info"]["tensor_count"], 12)
             self.assertEqual(data["action128"]["normalized_actions"][0], [0.0] * 128)
             self.assertEqual(data["video"]["shape"], [33, 32, 32, 3])
             self.assertEqual(client.get(data["video"]["url"]).content, b"unit-mp4")
@@ -233,6 +262,7 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             self.assertEqual(raw_response.status_code, 200, raw_response.text)
             self.assertNotIn("video_frames", raw_response.json())
             self.assertEqual(raw_response.json()["normalized_actions"][0], [0.0] * 128)
+        self.assertFalse(store.directory.exists())
 
     def test_legacy_facade_schema_admission_and_shutdown(self):
         """Legacy clients retain SampleOutputs and a busy response instead of queueing."""
@@ -289,6 +319,19 @@ class TestCosmosPWMWAMServing(CustomTestCase):
             )
             self.assertEqual(client.get("/outputs/config.json").status_code, 404)
         self.assertFalse(app.state.pwm_wam_video_store.directory.exists())
+
+    def test_other_wam_pipelines_keep_their_existing_action_schema(self):
+        """The common WAM mode name does not opt other models into Action128."""
+        args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(default_num_inference_steps=30),
+            served_model_name="other-wam-model",
+        )
+        response = protocol.action_generation_response(
+            {"actions": np.zeros((4, 7), dtype=np.float32), "action_mode": "wam"},
+            args,
+        )
+        self.assertEqual(response["data"][0]["action"]["shape"], [4, 7])
+        self.assertNotIn("action128", response["data"][0])
 
 
 if __name__ == "__main__":

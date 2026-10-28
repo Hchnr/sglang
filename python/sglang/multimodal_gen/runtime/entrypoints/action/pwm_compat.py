@@ -34,7 +34,7 @@ from starlette.responses import FileResponse
 def create_app(generator, *, output_dir: str | Path = "outputs/pwm-wam") -> FastAPI:
     """Serve one native generator using Cosmos request and SampleOutputs shapes."""
     server_args = generator.server_args
-    checkpoint = Path(server_args.model_path)
+    checkpoint = Path(server_args.model_path).expanduser().resolve()
     config = json.loads((checkpoint / "config.json").read_text())
     spec = config["model"]["config"]["action128_spec"]
     fingerprint = hashlib.blake2b(

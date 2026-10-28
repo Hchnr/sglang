@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -36,6 +37,7 @@ class _VelocityModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.observations = []
+        self.load_info = {"tensor_count": 0, "shard_count": 0, "loaded_tensor_bytes": 0}
 
     def encode_inputs(self, ids, video, action, *args, action_dim_mask):
         self.observations.append((video.clone(), action.clone()))
@@ -65,6 +67,8 @@ class _TinyRuntime(PwmWamRuntime):
         self.device = torch.device("cpu")
         self.transformer = _VelocityModel()
         self.contract_fingerprint = "test"
+        self.checkpoint_path = "/fixed/artifact"
+        self.checkpoint_config_sha256 = "test-config-hash"
 
     def text_ids(self, caption):
         return torch.tensor([1 if caption else -1])
@@ -223,6 +227,12 @@ class TestPwmRuntimeContracts(CustomTestCase):
             {"skip_text_tokens_for_cfg": True},
             {"sampler": "edm"},
             {"sigma_max": 1},
+            {"n": 2},
+            {"num_outputs_per_prompt": 2},
+            {"enable_prefix_cache": True},
+            {"guidence_sclae": 2},
+            {"duration_template": "custom"},
+            {"video_save_quality": 4},
             {"num_outputs": 2},
             {"num_frames": 7},
             {"negative_prompt": 0},
@@ -234,6 +244,44 @@ class TestPwmRuntimeContracts(CustomTestCase):
             raw["extra"]["action128"]["action_dim_mask"] = invalid_mask
             with self.assertRaisesRegex(ValueError, "action_dim_mask"):
                 validate_request(raw, self.spec)
+
+    def test_layout_fails_before_fetch_and_bad_media_does_not_poison_next_request(self):
+        """Malformed declarations fail admission; media errors leave no request state."""
+        raw = copy.deepcopy(self.raw)
+        raw["vision_path"] = "https://example.invalid/observation.png"
+        raw["extra"]["action128"].update(
+            selected_roles=["main", "wrist"],
+            camera_layout=[["main", "top", 48, 16], ["wrist", "bottom", 32, 16]],
+        )
+        with patch(
+            "requests.get", side_effect=AssertionError("fetched invalid layout")
+        ):
+            with self.assertRaisesRegex(ValueError, "Bottom cameras"):
+                validate_request(raw, self.spec)
+        bad = self.directory / "invalid.png"
+        bad.write_bytes(b"not a media file")
+        with self.assertRaisesRegex(ValueError, "Cannot decode"):
+            prepare_request({**self.raw, "vision_path": str(bad)}, self.spec)
+        recovered = prepare_request(self.raw, self.spec)
+        self.assertEqual(recovered.pixels.shape, (3, 1, 32, 48))
+        self.assertEqual(json.loads(recovered.caption)["command"], "Move the block")
+
+    def test_cosmos_metadata_and_defaults_round_trip_without_selecting_domain(self):
+        """Historical domain_name is a label; Action128 source-domain remains explicit."""
+        raw = {
+            **self.raw,
+            "domain_name": "libero",
+            "model": "cosmos-pwm-wam",
+            "output_dir": "ignored-client-output",
+            "name": "sample",
+            "num_outputs": None,
+            "sigma_max": 80,
+            "video_save_quality": 10,
+            "negative_metadata_mode": "none",
+        }
+        request = prepare_request(raw, self.spec)
+        self.assertEqual(request.domain, "test")
+        self.assertEqual(json.loads(request.caption)["task_title"], "sample")
 
     def test_noise_streams_and_fixed_coordinates(self):
         """VIDEO/ACTION reset NumPy independently; holes and conditioning are fixed."""
@@ -321,7 +369,46 @@ class TestPwmRuntimeContracts(CustomTestCase):
         self.assertEqual(result["actions"][0, 0], 2)
         self.assertEqual(result["actions"][0, 5], 5)
         self.assertEqual(result["actions"][0, 1], 0)
+        self.assertEqual(result["checkpoint_path"], "/fixed/artifact")
+        self.assertEqual(result["checkpoint_config_sha256"], "test-config-hash")
+        self.assertEqual(result["loader_info"]["tensor_count"], 0)
         np.testing.assert_array_equal(result["video_frames"][0, 0, 0], [128, 159, 95])
+
+    def test_checkpoint_sdpa_policy_restores_flags_after_success_and_error(self):
+        """SGLang disables cuDNN globally; WAM must isolate its reference policy."""
+        runtime = _TinyRuntime()
+        runtime.spec = self.spec
+        clean = torch.zeros(48, 2, 2, 2)
+
+        def flags():
+            return (
+                torch.backends.cuda.flash_sdp_enabled(),
+                torch.backends.cuda.mem_efficient_sdp_enabled(),
+                torch.backends.cuda.math_sdp_enabled(),
+                torch.backends.cuda.cudnn_sdp_enabled(),
+            )
+
+        def encode(request):
+            self.assertEqual(flags(), (True, True, True, True))
+            return clean
+
+        with sdpa_kernel([SDPBackend.MATH]):
+            previous = flags()
+            with patch.object(runtime, "encode_observation", side_effect=encode):
+                with patch.object(
+                    runtime, "sample", side_effect=RuntimeError("failed")
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "failed"):
+                        runtime.forward(self.raw)
+                self.assertEqual(flags(), previous)
+                with patch.object(runtime, "_finalize", return_value={}):
+                    result = runtime.forward(self.raw)
+                self.assertEqual(flags(), previous)
+        self.assertEqual(
+            set(result["timing_seconds"]),
+            {"prepare", "vae_encode", "sample", "finalize", "total"},
+        )
+        self.assertEqual(result["elapsed_seconds"], result["timing_seconds"]["total"])
 
 
 if __name__ == "__main__":

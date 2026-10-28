@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +35,18 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.utils.json_response import orjson_response
 
-router = APIRouter(prefix="/v1/actions", tags=["actions"])
+
+@asynccontextmanager
+async def action_lifespan(app):
+    try:
+        yield
+    finally:
+        store = getattr(app.state, "pwm_wam_video_store", None)
+        if store is not None:
+            await run_in_threadpool(store.close)
+
+
+router = APIRouter(prefix="/v1/actions", tags=["actions"], lifespan=action_lifespan)
 
 _ACTION_VIDEO_EXTENSIONS = {
     ".avi",

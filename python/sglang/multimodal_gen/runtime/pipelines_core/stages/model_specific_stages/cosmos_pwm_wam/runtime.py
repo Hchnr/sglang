@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Adapted from vllm-omni-pwm d3e9aad33e861b69be16c4f341695e1cc12b3314.
 """Native PWM WAM inference with request-owned joint flow state.
 
 Adapted from vLLM-Omni's PWM runtime. Only immutable model components live on the
@@ -18,6 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.positions import (
     position_ids,
@@ -95,9 +97,13 @@ class PwmWamRuntime(nn.Module):
             preserve_checkpoint_rms,
         )
 
-        checkpoint = Path(checkpoint)
+        checkpoint = Path(checkpoint).expanduser().resolve()
+        self.checkpoint_path = str(checkpoint)
+        config_bytes = (checkpoint / "config.json").read_bytes()
+        # This identifies the exported configuration, not the weight contents.
+        self.checkpoint_config_sha256 = hashlib.sha256(config_bytes).hexdigest()
         self.device = torch.device(device)
-        config = json.loads((checkpoint / "config.json").read_text())["model"]["config"]
+        config = json.loads(config_bytes)["model"]["config"]
         self.spec = config["action128_spec"]
         self.transformer = PwmWamTransformer.from_pretrained(
             checkpoint, device=self.device, dtype=torch.bfloat16, load_mode="serial"
@@ -348,6 +354,9 @@ class PwmWamRuntime(nn.Module):
                 request.caption.encode()
             ).hexdigest(),
             contract_fingerprint=self.contract_fingerprint,
+            checkpoint_path=self.checkpoint_path,
+            checkpoint_config_sha256=self.checkpoint_config_sha256,
+            loader_info=dict(self.transformer.load_info),
             video_frames=frames,
             video_fps=request.video_fps,
             parameters={
@@ -360,6 +369,20 @@ class PwmWamRuntime(nn.Module):
 
     @torch.inference_mode()
     def forward(self, raw: dict) -> dict[str, Any]:
+        # The shared SGLang platform disables cuDNN SDPA for other pipelines.
+        # This checkpoint was validated with PyTorch's full backend selection;
+        # preserve that policy for WAM and restore the caller's flags on exit.
+        with sdpa_kernel(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+                SDPBackend.CUDNN_ATTENTION,
+            ]
+        ):
+            return self._forward(raw)
+
+    def _forward(self, raw: dict) -> dict[str, Any]:
         # This eager baseline records completed GPU work, including the small
         # synchronization cost at stage boundaries, rather than enqueue times.
         def timestamp() -> float:
