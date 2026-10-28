@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +21,20 @@ from torch import Tensor, nn
 
 Rope = tuple[Tensor, Tensor]
 Streams = tuple[Tensor, Tensor, Tensor]
+UndKV = tuple[Tensor, Tensor]
+
+
+class PwmUndCache(NamedTuple):
+    """One request's conditioning branch; the model never retains this object.
+
+    Keys are the unnormalized linear outputs, so normalization and each tower's
+    RoPE retain the uncached arithmetic. Only the final UND hidden state is
+    retained; intermediate UND residual streams are released after prefill.
+    Callers must build separate caches for conditional and unconditional text.
+    """
+
+    layers: tuple[UndKV, ...]
+    hidden: Tensor
 
 
 def mask_actions(actions: Tensor, mask: Tensor | None) -> Tensor:
@@ -157,21 +172,38 @@ class PwmThreeTowerLayer(nn.Module):
             action_width, action_intermediate, heads=heads, kv_heads=kv_heads, dim=dim
         )
 
+    def prefill_und(self, und: Tensor, rope: Rope) -> tuple[Tensor, UndKV]:
+        """Compute the causal UND stream, which cannot read either noisy tower."""
+        attn = self.self_attn
+        qu, raw_ku, vu = attn.project(self.input_layernorm(und), normalize_key=False)
+        ku = attn.k_norm(raw_ku)
+        yu = attention(rotate(qu, rope), rotate(ku, rope), vu, causal=True)
+        und = und + attn.o_proj(yu)
+        und = und + self.mlp(self.post_attention_layernorm(und))
+        return und, (raw_ku, vu)
+
     def forward(
         self,
         streams: Streams,
         rope: tuple[Rope, Rope, Rope],
         action_rope: tuple[Rope, Rope, Rope],
+        und_cache: UndKV | None = None,
     ) -> Streams:
         und, video, action = streams
         attn, act = self.self_attn, self.action_block_moe_gen_action
         # Every tower reads the same pre-update layer state.
-        qu, raw_ku, vu = attn.project(self.input_layernorm(und), normalize_key=False)
+        if und_cache is None:
+            qu, raw_ku, vu = attn.project(
+                self.input_layernorm(und), normalize_key=False
+            )
+        else:
+            raw_ku, vu = und_cache
         ku = attn.k_norm(raw_ku)
         qv, kv, vv = attn.project(self.input_layernorm_moe_gen(video), "_moe_gen")
         qa, ka, va = act.project(act.input_layernorm(action))
         keys, values = (ku, kv, ka), (vu, vv, va)
-        yu = attention(rotate(qu, rope[0]), rotate(ku, rope[0]), vu, causal=True)
+        if und_cache is None:
+            yu = attention(rotate(qu, rope[0]), rotate(ku, rope[0]), vu, causal=True)
         yv = attention(
             rotate(qv, rope[1]),
             torch.cat([rotate(k, r) for k, r in zip(keys, rope)]),
@@ -184,8 +216,11 @@ class PwmThreeTowerLayer(nn.Module):
         )
         action = action + act.o_proj(ya)
         action = action + act.mlp(act.post_attention_layernorm(action))
-        und = und + attn.o_proj(yu)
-        und = und + self.mlp(self.post_attention_layernorm(und))
+        if und_cache is None:
+            und = und + attn.o_proj(yu)
+            und = und + self.mlp(self.post_attention_layernorm(und))
+        # Cached generation consumes only KV. Its UND slot is an unused
+        # placeholder; forward_hidden returns the cache's final UND state.
         video = video + attn.o_proj_moe_gen(yv)
         video = video + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(video))
         return und, video, action
@@ -508,23 +543,45 @@ class PwmWamTransformer(nn.Module):
         action = self.llm2action(streams[2], projection_ids)
         return velocity, mask_actions(action, action_dim_mask)
 
+    @torch.no_grad()
+    def build_und_cache(self, text_ids: Tensor, rope: Rope) -> PwmUndCache:
+        """Prefill one branch without retaining any request state on the model.
+
+        Build and consume under the same precision/attention context. The caller
+        owns its lifetime and must not reuse it for another request or text.
+        """
+        stack = self.language_model.model
+        und = stack.embed_tokens(text_ids)
+        layers = []
+        for layer in stack.layers:
+            und, kv = layer.prefill_und(und, rope)
+            layers.append(kv)
+        return PwmUndCache(tuple(layers), und)
+
     def forward_hidden(
         self,
         streams: Streams,
         rope: tuple[Rope, Rope, Rope],
         action_rope: tuple[Rope, Rope, Rope],
-        und_cache=None,
+        und_cache: PwmUndCache | None = None,
         attention_metadata=None,
     ) -> Streams:
-        if und_cache is not None or attention_metadata is not None:
+        if attention_metadata is not None:
             raise ValueError(
-                "PWM eager SDPA does not support caching or packed attention metadata"
+                "PWM eager SDPA does not support packed attention metadata"
             )
-        for layer in self.language_model.model.layers:
-            streams = layer(streams, rope, action_rope)
         stack = self.language_model.model
+        if und_cache is not None and len(und_cache.layers) != len(stack.layers):
+            raise ValueError("PWM UND cache must contain one KV pair per layer")
+        for index, layer in enumerate(stack.layers):
+            streams = layer(
+                streams,
+                rope,
+                action_rope,
+                None if und_cache is None else und_cache.layers[index],
+            )
         return (
-            stack.norm(streams[0]),
+            stack.norm(streams[0] if und_cache is None else und_cache.hidden),
             stack.norm_moe_gen(streams[1]),
             stack.norm_moe_gen_action(streams[2]),
         )

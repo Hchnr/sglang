@@ -1,5 +1,7 @@
 # 三塔 PWM WAM 接入 SGLang：结论
 
+更新（18:34）：完整目标继续推进中。正在验证请求内 UND 复用，并通过同 Torch/cuDNN 的原像素对照加强正确性证据；下文为已完成的首版基线，新增优化尚未计入性能结论。
+
 原生接入与功能验证已完成：真实 checkpoint 由 SGLang worker 直接执行 UND、VIDEO、ACTION 三塔及联合 UniPC，Python、原生 action HTTP 和 Cosmos `/generate` 兼容入口均可交付动作及可选视频。
 
 **跨环境原始像素端到端严格数值一致尚未通过。** 已定位 VAE BF16 卷积差异；最终六种请求的 active physical action relative L2 为 0.007525–0.016698。未放宽阈值或替换生产输入，这些误差不能转为机器人任务成功率结论。当前 eager 接入也没有超过已有 Cosmos FA3+compile 的性能。

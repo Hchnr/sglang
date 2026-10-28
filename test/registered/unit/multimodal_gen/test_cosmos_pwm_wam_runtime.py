@@ -2,9 +2,11 @@
 """WAM media/caption protocol and joint solver invariants, without model weights."""
 
 import copy
+import gc
 import json
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -45,14 +47,20 @@ class _VelocityModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.observations = []
+        self.caches = []
         self.load_info = {"tensor_count": 0, "shard_count": 0, "loaded_tensor_bytes": 0}
 
     def encode_inputs(self, ids, video, action, *args, action_dim_mask):
         self.observations.append((video.clone(), action.clone()))
         return ids, video, action
 
-    def forward_hidden(self, streams, rope, action_rope):
-        return streams
+    def build_und_cache(self, ids, rope):
+        cache = ids.clone()
+        self.caches.append(weakref.ref(cache))
+        return cache
+
+    def forward_hidden(self, streams, rope, action_rope, *, und_cache=None):
+        return streams if und_cache is None else (und_cache, *streams[1:])
 
     def decode_outputs(self, streams, *args, action_dim_mask):
         ids, video, action = streams
@@ -73,6 +81,7 @@ class _TinyRuntime(PwmWamRuntime):
     def __init__(self):
         nn.Module.__init__(self)
         self.device = torch.device("cpu")
+        self.enable_und_cache = False
         self.transformer = _VelocityModel()
         self.contract_fingerprint = "test"
         self.checkpoint_path = "/fixed/artifact"
@@ -448,6 +457,62 @@ class TestPwmRuntimeContracts(CustomTestCase):
         active = torch.tensor(request.mask)
         # Two conditional updates (+.05) and one CFG update (-.35).
         torch.testing.assert_close(action[:, active], initial[:, active] - 0.25)
+
+    def test_und_cache_is_request_owned_and_skips_unused_cfg_branch(self):
+        """Cached text cannot survive a request or turn into unconditional work."""
+        runtime = _TinyRuntime()
+        runtime.enable_und_cache = True
+        clean = torch.zeros(48, 3, 2, 2)
+        raw = {**self.raw, "guidance": 2, "enable_und_cache": False}
+        request = prepare_request(raw, self.spec)
+        expected = runtime.sample(request, clean)
+        self.assertEqual(len(runtime.transformer.caches), 0)
+        for guidance, interval, expected_caches in (
+            (2, None, 2),
+            (1, None, 1),
+            (2, [950, 1000], 1),
+            (2, [100, 900], 2),
+        ):
+            raw.update(guidance=guidance, guidance_interval=interval)
+            raw.pop("enable_und_cache", None)
+            request = prepare_request(raw, self.spec)
+            before = len(runtime.transformer.caches)
+            actual = runtime.sample(request, clean)
+            self.assertEqual(len(runtime.transformer.caches) - before, expected_caches)
+            self.assertTrue(all(ref() is None for ref in runtime.transformer.caches))
+            if guidance == 2 and interval is None:
+                for value, baseline in zip(actual, expected):
+                    torch.testing.assert_close(value, baseline, rtol=0, atol=0)
+        for invalid in (None, 0, 1, "false"):
+            with self.assertRaisesRegex(ValueError, "enable_und_cache"):
+                validate_request({**self.raw, "enable_und_cache": invalid}, self.spec)
+
+    def test_und_cache_released_on_failure_and_recreated_afterward(self):
+        """Failed sampling must not retain conditioning or poison the next call."""
+        runtime = _TinyRuntime()
+        request = prepare_request(
+            {**self.raw, "guidance": 2, "enable_und_cache": True}, self.spec
+        )
+        clean = torch.zeros(48, 3, 2, 2)
+        with (
+            patch.object(
+                runtime.transformer,
+                "decode_outputs",
+                side_effect=RuntimeError("failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "failure"),
+        ):
+            runtime.sample(request, clean)
+        gc.collect()
+        self.assertEqual(len(runtime.transformer.caches), 1)
+        self.assertTrue(all(ref() is None for ref in runtime.transformer.caches))
+        actual = runtime.sample(request, clean)
+        self.assertEqual(len(runtime.transformer.caches), 3)
+        request.enable_und_cache = False
+        expected = runtime.sample(request, clean)
+        for value, baseline in zip(actual, expected):
+            torch.testing.assert_close(value, baseline, rtol=0, atol=0)
+        self.assertTrue(all(ref() is None for ref in runtime.transformer.caches))
 
     def test_finalization_uses_domain_stats_and_fp32_video_conversion(self):
         """Projection id is not a normalizer index; source VAE returns FP32 pixels."""

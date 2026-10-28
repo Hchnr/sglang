@@ -89,10 +89,14 @@ class PwmWamRuntime(nn.Module):
         tokenizer_path: str,
         device: str | torch.device = "cuda",
         attention_backend: str = "sdpa",
+        enable_und_cache: bool = False,
     ):
         super().__init__()
         if attention_backend != "sdpa":
             raise ValueError("PWM WAM currently supports eager SDPA only")
+        if type(enable_und_cache) is not bool:
+            raise ValueError("enable_und_cache must be a boolean")
+        self.enable_und_cache = enable_und_cache
         from diffusers import AutoencoderKLWan
         from transformers import AutoTokenizer
 
@@ -239,7 +243,10 @@ class PwmWamRuntime(nn.Module):
             device=self.device,
         )
         branches = []
-        for caption in (request.caption, request.negative_prompt):
+        captions = (request.caption,)
+        if request.guidance != 1:
+            captions += (request.negative_prompt,)
+        for caption in captions:
             ids = self.text_ids(caption)
             grid = (
                 clean.shape[1],
@@ -260,11 +267,24 @@ class PwmWamRuntime(nn.Module):
                 rotary(p, dtype=torch.bfloat16, action=True) for p in positions
             )
             branches.append((ids, ropes, action_ropes))
+        use_und_cache = (
+            self.enable_und_cache
+            if request.enable_und_cache is None
+            else request.enable_und_cache
+        )
+        # Text is independent of diffusion time/noise. Only this request owns
+        # these caches; CFG branches cannot share conditioning, and an unused
+        # unconditional branch is never evaluated just to populate a cache.
+        und_caches = [None] * len(branches)
         scheduler = self._new_scheduler(request)
         generator = torch.Generator(device=self.device).manual_seed(request.seed)
 
         def velocity(branch_index: int, timestep: Tensor) -> Tensor:
             ids, rope, action_rope = branches[branch_index]
+            if use_und_cache and und_caches[branch_index] is None:
+                und_caches[branch_index] = self.transformer.build_und_cache(
+                    ids, rope[0]
+                )
             streams = self.transformer.encode_inputs(
                 ids,
                 latent[:video_size].reshape(clean.shape),
@@ -275,7 +295,9 @@ class PwmWamRuntime(nn.Module):
                 action_indices,
                 action_dim_mask=active,
             )
-            hidden = self.transformer.forward_hidden(streams, rope, action_rope)
+            hidden = self.transformer.forward_hidden(
+                streams, rope, action_rope, und_cache=und_caches[branch_index]
+            )
             vv, va = self.transformer.decode_outputs(
                 hidden,
                 tuple(clean.shape),
@@ -375,6 +397,11 @@ class PwmWamRuntime(nn.Module):
                 "num_frames": request.video_frames,
                 "guidance": request.guidance,
                 "shift": request.shift,
+                "enable_und_cache": (
+                    self.enable_und_cache
+                    if request.enable_und_cache is None
+                    else request.enable_und_cache
+                ),
             },
         }
 

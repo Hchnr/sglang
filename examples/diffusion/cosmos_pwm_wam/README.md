@@ -42,7 +42,8 @@ pip install -e 'python[diffusion]'
 ```json
 {
   "vae_path": "/models/pwm-vae",
-  "tokenizer_path": "/models/pwm-tokenizer"
+  "tokenizer_path": "/models/pwm-tokenizer",
+  "enable_und_cache": false
 }
 ```
 
@@ -152,6 +153,7 @@ def main():
         pipeline_config={
             "vae_path": "/models/pwm-vae",
             "tokenizer_path": "/models/pwm-tokenizer",
+            "enable_und_cache": False,
         },
         num_gpus=1, tp_size=1, sp_degree=1, batching_max_size=1,
         attention_backend="torch_sdpa", enable_cfg_parallel=False,
@@ -186,6 +188,34 @@ if __name__ == "__main__":
 
 `timing_seconds` 分为 `prepare`、`vae_encode`、`sample`、`finalize` 和 `total`。
 GPU 阶段边界执行同步，因此包含同步成本；不包含排队、HTTP 传输或 MP4 编码时间。
+
+## 请求内 UND 缓存
+
+`pipeline_config.enable_und_cache` 控制请求内的 UND 计算复用，当前默认 `false`。
+开启时，每个实际使用的条件分支只计算一次 UND，并在该请求的去噪步骤中复用
+逐层 K/V 和最终 UND hidden states。CFG 的正、负条件分别持有缓存；请求结束或
+失败后释放，后续请求重新计算。此开关不改变采样参数、动作单位或 action/video 字段的含义。
+
+原始 WAM 请求可设置 `"enable_und_cache": true` 或 `false`。Python 的
+`CosmosPWMWAMSamplingParams.enable_und_cache=None` 表示继承 pipeline 默认值；
+实际 bool 值在入队前固定。`false` 保留逐步骤重新计算 UND 的基线，供数值对照。
+原生 HTTP 或 `generate_action()` 也接受：
+
+```python
+payload = {
+    "wam_request": raw,
+    "runtime": {"enable_und_cache": True},
+}
+```
+
+同一请求不能在 `wam_request` 与外层 `runtime` 重复指定此开关；字段只接受 bool，
+不会把字符串 `"false"` 或数字 `0` 当作关闭。`GET /v1/actions/metadata` 返回服务
+默认值以及 `request_local_und_cache=true`、`cross_request_und_cache=false`；原生
+响应的 `parameters.enable_und_cache` 记录本次实际选择。
+
+`runtime.prefix_cache` 和原始请求的 `enable_prefix_cache` 仍不支持开启。
+`enable_torch_compile`、`regional_compile`、`cache_dit_config`、attention backend
+autotuning 与非 SDPA attention backend 也仍会报错；UND 缓存不会隐式启用这些优化。
 
 ## HTTP 与 Cosmos 兼容入口
 

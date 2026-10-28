@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -137,9 +138,30 @@ def main():
         help="Compare the first request against saved reference",
     )
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument(
+        "--und-cache",
+        choices=("default", "off", "on", "compare"),
+        default="default",
+        help="Pin request-local UND reuse, or compare off/on/on/off for each request",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Untimed rounds of the first request for each selected cache mode",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="After timing, capture the first request for each cache mode (runtime only)",
+    )
     args = parser.parse_args()
-    if args.repeat < 1:
-        parser.error("--repeat must be positive")
+    if args.repeat < 1 or args.warmup < 0:
+        parser.error("--repeat must be positive and --warmup nonnegative")
+    if args.profile and args.route != "runtime":
+        parser.error(
+            "--profile requires --route runtime; the Python worker is separate"
+        )
     args.output.mkdir(parents=True, exist_ok=False)
 
     import torch
@@ -195,6 +217,9 @@ def main():
     torch.cuda.synchronize()
     summary = {
         "route": args.route,
+        "argv": sys.argv,
+        "und_cache": args.und_cache,
+        "warmup_rounds": args.warmup,
         "load_seconds": time.perf_counter() - started,
         "gpu": torch.cuda.get_device_name(),
         "versions": {
@@ -203,20 +228,57 @@ def main():
         },
         "requests": [],
     }
+    cache_modes = {
+        "default": (None,),
+        "off": (False,),
+        "on": (True,),
+        "compare": (False, True, True, False),
+    }[args.und_cache]
+
+    def request_variant(path, cache):
+        raw = load_request(path)
+        if args.und_cache == "compare" and raw.get("seed") is None:
+            raise ValueError("UND cache comparisons require an explicit fixed seed")
+        if cache is not None:
+            raw["enable_und_cache"] = cache
+        return raw
+
+    def comparison_key(raw):
+        key_fields = dict(raw)
+        if args.und_cache == "compare":
+            key_fields.pop("enable_und_cache", None)
+        return json.dumps(key_fields, sort_keys=True)
+
     previous = {}
     try:
-        for index, request_path in enumerate(args.request * args.repeat):
-            raw = load_request(request_path)
+        for _ in range(args.warmup):
+            for cache in dict.fromkeys(cache_modes):
+                validate_result(run(request_variant(args.request[0], cache)))
+        entries = [
+            (path, cache)
+            for path in args.request * args.repeat
+            for cache in cache_modes
+        ]
+        for index, (request_path, cache) in enumerate(entries):
+            raw = request_variant(request_path, cache)
             torch.cuda.reset_peak_memory_stats()
             start = time.perf_counter()
             result = run(raw)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
             validate_result(result)
+            if (
+                cache is not None
+                and result.get("parameters", {}).get("enable_und_cache") is not cache
+            ):
+                raise AssertionError("Requested UND cache mode was not executed")
             directory = args.output / f"{index:03d}"
             save_result(result, directory)
             row = {
                 "request": str(request_path),
+                "enable_und_cache": result.get("parameters", {}).get(
+                    "enable_und_cache"
+                ),
                 "elapsed_seconds": elapsed,
                 "parent_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "parent_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
@@ -225,7 +287,7 @@ def main():
             # GPU memory for the Python route lives in the worker, not the parent.
             if index == 0 and args.reference:
                 row["reference"] = compare_reference(result, args.reference)
-            key = json.dumps(raw, sort_keys=True)
+            key = comparison_key(raw)
             if key in previous:
                 baseline = previous[key]
                 row["repeat"] = {
@@ -240,6 +302,37 @@ def main():
             summary["requests"].append(row)
             (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
             print(json.dumps(row), flush=True)
+        if args.profile:
+            from torch.profiler import ProfilerActivity, profile
+
+            summary["profiles"] = []
+            for cache in dict.fromkeys(cache_modes):
+                raw = request_variant(args.request[0], cache)
+                label = "default" if cache is None else ("on" if cache else "off")
+                with profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                ) as prof:
+                    result = run(raw)
+                    torch.cuda.synchronize()
+                validate_result(result)
+                baseline = previous[comparison_key(raw)]
+                exact = {
+                    field: array_metrics(result[field], baseline[field])
+                    for field in ("actions", "normalized_actions", "video_frames")
+                    if result.get(field) is not None
+                }
+                if not all(value["exact"] for value in exact.values()):
+                    raise AssertionError("Profiling changed request output")
+                save_result(result, args.output / f"profile_{label}")
+                trace = args.output / f"profile_{label}.json"
+                prof.export_chrome_trace(str(trace))
+                (args.output / f"profile_{label}_operators.txt").write_text(
+                    prof.key_averages().table(
+                        sort_by="self_device_time_total", row_limit=40
+                    )
+                )
+                summary["profiles"].append({"path": str(trace), "parity": exact})
+                (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
     finally:
         if generator is not None:
             generator.shutdown()

@@ -51,6 +51,7 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
     vae_decode_precision: str | None = "bf16"
     vae_path: str | None = None
     tokenizer_path: str | None = None
+    enable_und_cache: bool = False
     default_num_inference_steps: int = 30
     action_dim: int = 128
 
@@ -64,6 +65,8 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
         from sglang.multimodal_gen.runtime.server_args import Backend
 
+        if not isinstance(self.enable_und_cache, bool):
+            raise TypeError("Cosmos PWM WAM enable_und_cache must be a boolean")
         if server_args.backend == Backend.DIFFUSERS:
             raise ValueError("Cosmos PWM WAM requires --backend sglang")
         if server_args.disagg_role != RoleType.MONOLITHIC:
@@ -90,6 +93,14 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
             raise ValueError("Cosmos PWM WAM requires --batching-max-size 1")
         if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
             raise ValueError("Cosmos PWM WAM currently supports eager execution only")
+        if server_args.regional_compile:
+            raise ValueError("Cosmos PWM WAM does not support regional_compile")
+        if server_args.cache_dit_config is not None:
+            raise ValueError("Cosmos PWM WAM does not support cache_dit_config")
+        if server_args.enable_attention_backend_autotune:
+            raise ValueError(
+                "Cosmos PWM WAM does not support attention backend autotuning"
+            )
         if (
             server_args.quantization
             or server_args.component_quantizations
@@ -164,6 +175,7 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
                 "guidance_scale": 1.0,
                 "flow_shift": 10.0,
                 "return_video": True,
+                "enable_und_cache": self.enable_und_cache,
             },
             "capabilities": {
                 "action_modes": ["wam"],
@@ -171,6 +183,8 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
                 "multiple_candidates": False,
                 "cuda_graph": False,
                 "exact_prefix_cache": False,
+                "request_local_und_cache": True,
+                "cross_request_und_cache": False,
                 "realtime_websocket": False,
                 "openpi_websocket": False,
             },

@@ -67,6 +67,7 @@ class CosmosPWMWAMPipeline(ComposedPipelineBase):
                 tokenizer_path=config.tokenizer_path,
                 device=f"cuda:{torch.cuda.current_device()}",
                 attention_backend="sdpa",
+                enable_und_cache=config.enable_und_cache,
             )
         }
 

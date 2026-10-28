@@ -118,3 +118,23 @@ GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5
 - direct runtime 峰值 allocated 34,770,594,816 bytes、reserved 35,383,148,544 bytes；计时 960×640、40 actions、41 video frames、5 steps、guidance=1.5、shift=5、seed=42、不解码视频。完整数据见 `benchmark/summary.json`。带视频矩阵/HTTP 的耗时分开列于报告，没有把 Python 父进程零显存误报为 worker 显存。
 - 全部本任务 GPU 推理与 HTTP 服务/worker 已退出。共享节点收尾观察到其他外部 GPU 作业；未触碰它们，性能未宣称独占节点或统计显著性。
 - 最终报告补齐支持范围、文件落点、环境 overlay、资产摘要边界、数值未验收项、完整复现入口与本地提交。私有数据/权重/环境未加入 Git；无远端推送、无其他 checkout 改动。
+
+## 2026-10-28 18:34：继续完整目标的正确性与性能验收
+
+上一阶段属于 progress：原生实现、服务验证和性能基线有实际代码及证据，但完整目标尚未完成；原始像素数值差异与单请求优化仍需推进。当前 HEAD 为 `d38b24d0d4`，工作区原先干净，未发现遗留本任务运行进程。
+
+### 决策 D08：先消除确定不依赖采样状态的重复计算
+
+UND 只对自身做 causal attention，不读取 VIDEO/ACTION，也不读取 timestep。因此同请求内每个 CFG 分支可以预计算 UND 各层 raw K/V 和最终 hidden；保留 raw K，在 VIDEO/ACTION 消费时仍执行各自原有 k_norm/RoPE。缓存为 caller-owned NamedTuple，不写 model/global；条件和无条件分支分别构建，未使用的 CFG 分支不构建。异常/返回后释放，不做跨请求缓存。
+
+新增 `enable_und_cache`，启动配置为默认来源，request 可严格 bool 覆盖；HTTP runtime 字段与 raw 同名同时提供时拒绝。准确性和性能证据齐备之前默认关闭，oracle 路径继续可用。新增 CPU 测试覆盖多层 FP32/BF16 全三流 exact、UND 实际计算次数、缓存不变性和释放、CFG interval/unused branch、异常后重建。
+
+手动 harness 增加同进程 off/on/on/off 对照、显式 warmup 和额外 profiler capture；profile 耗时不混入正式 latency，输出逐元素检查不能省略。使用 diffusion performance/benchmark-profile 技能，以同 GPU、固定请求、保存动作/视频和源版本为条件。
+
+### 决策 D09：用同库环境隔离移植误差与跨库误差
+
+在当前 Cosmos Python 3.13/Torch 2.10 环境运行原生 leaf 实现，以原始像素对照当前 Cosmos 全轨迹。只在 `/tmp` 安装缺少的 msgspec wheel，不修改原环境；诊断工具用 namespace shells 避开无关 SGLang 父包初始化，加载逐文件 SHA-256 记录的原生 leaf snapshot，不修改其计算实现。该实验只证明 leaf 实现在同环境下的语义，不替代目标环境真实 SGLang worker 的部署验证。
+
+GPU0 初查空闲，导入期间外部任务占约 50 GB，第一次诊断加载 OOM；本任务退出并保留日志，没有采样结果或性能数据。外部任务随后自行结束，复查空闲后才重试。其他三卡有外部任务，未操作它们。
+
+18:41 更新：UND cache 版本 CPU 验证完成，model 9/9、runtime 17/17、serving 12/12，共38项通过。配置/API/内部cache与诊断benchmark工具单独本地提交；默认关闭，GPU一致性和性能暂不宣称通过。第二次同环境诊断遇外部新任务，supervisor检测到第二GPU进程后仅终止本任务，避免第二次OOM；脚本/环境/原生leaf snapshot SHA与资源审计保留。

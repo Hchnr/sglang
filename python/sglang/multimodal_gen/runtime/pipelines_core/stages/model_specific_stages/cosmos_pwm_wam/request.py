@@ -46,6 +46,7 @@ class PwmRequest(msgspec.Struct, kw_only=True):
     normalize_cfg: bool
     guidance_interval: tuple[float, float] | None
     return_video: bool
+    enable_und_cache: bool | None = None
 
 
 def canvas_seam(roles, layout, height=None, width=None):
@@ -217,10 +218,13 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
         "enable_breakable_cuda_graph",
         "enable_prefix_cache",
         "enable_torch_compile",
+        "enable_und_cache",
     } | fixed_defaults.keys()
     unknown = set(raw) - supported
     if unknown:
         raise ValueError(f"Unsupported WAM request fields: {sorted(unknown)}")
+    if "enable_und_cache" in raw and type(raw["enable_und_cache"]) is not bool:
+        raise ValueError("enable_und_cache must be a boolean")
     for name, default in fixed_defaults.items():
         if raw.get(name) is not None and raw[name] != default:
             raise ValueError(f"Native WAM requires the default {name}={default!r}")
@@ -547,4 +551,5 @@ def prepare_request(
             else None
         ),
         return_video=ext["return_video"],
+        enable_und_cache=raw.get("enable_und_cache"),
     )

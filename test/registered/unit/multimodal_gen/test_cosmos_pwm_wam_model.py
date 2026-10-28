@@ -2,16 +2,16 @@
 """Derived WAM attention/masking invariants and strict artifact bookkeeping."""
 
 import copy
+import gc
 import json
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 from safetensors.torch import save_file
-from torch import nn
-
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.positions import (
     position_ids,
 )
@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.scheduler import (
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.transformer import (
     PwmDomainLinear,
+    PwmRMSNorm,
     PwmThreeTowerLayer,
     PwmTimeEmbedding,
     PwmWamTransformer,
@@ -29,12 +30,140 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.vae import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from torch import nn
 
 # CPU tensor tests need the diffusion lane's optional dependencies.
 register_cuda_ci(est_time=8, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 class TestPwmModelContracts(CustomTestCase):
+    @staticmethod
+    def tiny_hidden_model(dtype):
+        model = PwmWamTransformer.__new__(PwmWamTransformer)
+        nn.Module.__init__(model)
+        model.language_model = nn.Module()
+        stack = nn.Module()
+        model.language_model.model = stack
+        stack.embed_tokens = nn.Embedding(32, 16)
+        stack.layers = nn.ModuleList(
+            [
+                PwmThreeTowerLayer(
+                    width=16,
+                    intermediate=32,
+                    action_width=8,
+                    action_intermediate=16,
+                    heads=2,
+                    kv_heads=1,
+                    dim=8,
+                )
+                for _ in range(3)
+            ]
+        )
+        stack.norm = PwmRMSNorm(16)
+        stack.norm_moe_gen = PwmRMSNorm(16)
+        stack.norm_moe_gen_action = PwmRMSNorm(8)
+        return model.to(dtype).eval()
+
+    @torch.inference_mode()
+    def test_request_und_cache_matches_uncached_cfg_branches(self):
+        """UND-only prefill preserves every layer's pre-update KV for both CFG branches."""
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(1214)
+                model = self.tiny_hidden_model(dtype)
+                stack = model.language_model.model
+                branches = []
+                # A/B/A checks both unequal CFG lengths and same-length requests
+                # with different contents; token count is never a cache identity.
+                for ids in ([2, 4, 6, 8, 10], [1, 3], [12, 14, 16, 18, 20]):
+                    ids = torch.tensor(ids)
+                    streams = (
+                        stack.embed_tokens(ids),
+                        torch.randn(4, 16, dtype=dtype),
+                        torch.randn(2, 8, dtype=dtype),
+                    )
+                    ropes = []
+                    for _ in range(2):
+                        phases = [torch.randn(len(x), 4).repeat(1, 2) for x in streams]
+                        ropes.append(
+                            tuple(
+                                (p.cos().to(dtype), p.sin().to(dtype)) for p in phases
+                            )
+                        )
+                    rope, action_rope = ropes
+                    branches.append(
+                        (
+                            streams,
+                            rope,
+                            action_rope,
+                            model.build_und_cache(ids, rope[0]),
+                        )
+                    )
+
+                snapshots = [
+                    tuple(t.clone() for kv in cache.layers for t in kv)
+                    + (cache.hidden.clone(),)
+                    for _, _, _, cache in branches
+                ]
+                for branch_index in (0, 1, 2, 1, 0):
+                    original, rope, action_rope, cache = branches[branch_index]
+                    streams = (
+                        original[0],
+                        torch.randn_like(original[1]),
+                        torch.randn_like(original[2]),
+                    )
+                    before = tuple(x.clone() for x in streams)
+                    expected = model.forward_hidden(streams, rope, action_rope)
+                    # Cached execution must actually skip UND projection/MLP,
+                    # not just produce equal outputs through the old path.
+                    calls = []
+
+                    def record_call(module, args, calls=calls):
+                        calls.append(module)
+
+                    handles = [
+                        module.register_forward_pre_hook(record_call)
+                        for layer in stack.layers
+                        for module in (layer.self_attn.q_proj, layer.mlp)
+                    ]
+                    try:
+                        actual = model.forward_hidden(
+                            streams, rope, action_rope, und_cache=cache
+                        )
+                    finally:
+                        for handle in handles:
+                            handle.remove()
+                    self.assertEqual(calls, [])
+                    for left, right in zip(actual, expected):
+                        torch.testing.assert_close(left, right, atol=0, rtol=0)
+                    for left, right in zip(streams, before):
+                        torch.testing.assert_close(left, right, atol=0, rtol=0)
+                    cached_tensors = tuple(t for kv in cache.layers for t in kv) + (
+                        cache.hidden,
+                    )
+                    for left, right in zip(cached_tensors, snapshots[branch_index]):
+                        torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+    def test_request_und_cache_has_no_model_owned_state_or_grad_graph(self):
+        """Ending a request releases its KV even when the model continues serving."""
+        torch.manual_seed(1214)
+        model = self.tiny_hidden_model(torch.float32)
+        state_keys = tuple(model.state_dict())
+        ids = torch.tensor([2, 4, 6])
+        rope = (torch.ones(3, 8), torch.zeros(3, 8))
+        # Caller grad mode is intentionally enabled: prefill must not retain the
+        # entire text tower's autograd graph alongside the small KV cache.
+        cache = model.build_und_cache(ids, rope)
+        tensors = tuple(t for kv in cache.layers for t in kv) + (cache.hidden,)
+        for tensor in tensors:
+            self.assertFalse(tensor.requires_grad)
+            self.assertIsNone(tensor.grad_fn)
+        references = [weakref.ref(t) for t in tensors]
+        del tensor, tensors, cache
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in references))
+        self.assertEqual(tuple(model.state_dict()), state_keys)
+
     @torch.inference_mode()
     def test_three_tower_visibility_and_causal_und(self):
         """Gen changes cannot reach UND, but VIDEO and ACTION exchange information."""

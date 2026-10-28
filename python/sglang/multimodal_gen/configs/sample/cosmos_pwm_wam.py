@@ -29,6 +29,7 @@ class CosmosPWMWAMSamplingParams(ActionSamplingParams):
     guidance_scale: float = 1.0
     flow_shift: float = 10.0
     return_video: bool = True
+    enable_und_cache: bool | None = None
     action_dim_mask: list[bool] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     wam_request: dict[str, Any] | None = field(
@@ -45,6 +46,10 @@ class CosmosPWMWAMSamplingParams(ActionSamplingParams):
             raise ValueError("Cosmos PWM WAM does not support sequence sharding")
         if not isinstance(self.return_video, bool):
             raise TypeError("return_video must be a boolean")
+        if self.enable_und_cache is not None and not isinstance(
+            self.enable_und_cache, bool
+        ):
+            raise TypeError("enable_und_cache must be a boolean or None")
         if self.wam_request is not None and not isinstance(self.wam_request, dict):
             raise ValueError("wam_request must be an object")
 
@@ -53,6 +58,14 @@ class CosmosPWMWAMSamplingParams(ActionSamplingParams):
         if raw.get("model_mode", "wam") != "wam":
             raise ValueError("Cosmos PWM WAM only supports model_mode='wam'")
         raw["model_mode"] = "wam"
+        if (
+            self.enable_und_cache is not None
+            and "enable_und_cache" in raw
+            and raw["enable_und_cache"] is not self.enable_und_cache
+        ):
+            raise ValueError(
+                "Conflicting enable_und_cache in wam_request and sampling params"
+            )
         fields = {
             "prompt": self.prompt,
             "prompt_path": self.prompt_path,
@@ -64,6 +77,7 @@ class CosmosPWMWAMSamplingParams(ActionSamplingParams):
             "num_steps": self.num_inference_steps,
             "guidance": self.guidance_scale,
             "shift": self.flow_shift,
+            "enable_und_cache": self.enable_und_cache,
         }
         for name, value in fields.items():
             if (
@@ -105,6 +119,9 @@ class CosmosPWMWAMSamplingParams(ActionSamplingParams):
 
         config = json.loads((Path(server_args.model_path) / "config.json").read_text())
         spec = config["model"]["config"]["action128_spec"]
-        self.wam_request = validate_request(self.build_wam_request(), spec)
+        raw = self.build_wam_request()
+        raw.setdefault("enable_und_cache", server_args.pipeline_config.enable_und_cache)
+        self.wam_request = validate_request(raw, spec)
+        self.enable_und_cache = self.wam_request["enable_und_cache"]
         self.seed = self.wam_request["seed"]
         self.num_inference_steps = self.wam_request["num_steps"]

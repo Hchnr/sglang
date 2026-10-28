@@ -169,6 +169,104 @@ class TestCosmosPWMWAMServing(CustomTestCase):
         direct._adjust(self.server_args)
         self.assertEqual(direct.wam_request["prompt"], "Move right")
 
+    def test_und_cache_default_and_request_overrides_reach_worker_contract(self):
+        for default in (False, True):
+            self.server_args.pipeline_config.enable_und_cache = default
+            inherited = protocol.build_action_sampling_params(
+                {"wam_request": self.raw}, self.server_args
+            )
+            self.assertIs(inherited.wam_request["enable_und_cache"], default)
+            self.server_args.pipeline_config.enable_und_cache = not default
+            inherited._adjust(self.server_args)
+            self.assertIs(inherited.wam_request["enable_und_cache"], default)
+            self.server_args.pipeline_config.enable_und_cache = default
+            for enabled in (False, True):
+                python_params = SamplingParams.from_user_sampling_params_args(
+                    str(self.root),
+                    self.server_args,
+                    wam_request=self.raw,
+                    enable_und_cache=enabled,
+                )
+                http_params = protocol.build_action_sampling_params(
+                    {"wam_request": self.raw, "runtime": {"enable_und_cache": enabled}},
+                    self.server_args,
+                )
+                direct_raw = {**self.raw, "enable_und_cache": enabled}
+                raw_params = protocol.build_action_sampling_params(
+                    direct_raw, self.server_args
+                )
+                expected = python_params.build_request_extra()
+                self.assertEqual(http_params.build_request_extra(), expected)
+                self.assertEqual(raw_params.build_request_extra(), expected)
+                self.assertIs(expected["cosmos_pwm_wam"]["enable_und_cache"], enabled)
+            metadata = self.server_args.pipeline_config.action_metadata(
+                self.server_args
+            )
+            self.assertIs(metadata["defaults"]["enable_und_cache"], default)
+            self.assertTrue(metadata["capabilities"]["request_local_und_cache"])
+            self.assertFalse(metadata["capabilities"]["cross_request_und_cache"])
+            self.assertFalse(metadata["capabilities"]["exact_prefix_cache"])
+        self.assertNotIn("enable_und_cache", self.raw)
+
+    def test_und_cache_override_rejects_ambiguous_or_nonboolean_values(self):
+        for wrapped in (False, True):
+            raw = {**self.raw, "enable_und_cache": False}
+            payload = {"wam_request": raw} if wrapped else raw
+            payload["runtime"] = {"enable_und_cache": False}
+            with (
+                self.subTest(wrapped=wrapped),
+                self.assertRaisesRegex(ValueError, "both"),
+            ):
+                lower_pwm_wam_request(payload)
+        for value in ("false", 0, None):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                lower_pwm_wam_request(
+                    {"wam_request": self.raw, "runtime": {"enable_und_cache": value}}
+                )
+        with self.assertRaises(TypeError):
+            CosmosPWMWAMSamplingParams(enable_und_cache="false")
+
+    def test_unsupported_optimization_settings_fail_during_server_resolution(self):
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        kwargs = {
+            "model_path": str(self.root),
+            "backend": "sglang",
+            "pipeline_class_name": "CosmosPWMWAMPipeline",
+            "pipeline_config": {
+                "vae_path": str(self.root),
+                "tokenizer_path": str(self.root),
+                "enable_und_cache": True,
+            },
+            "attention_backend": "torch_sdpa",
+            "num_gpus": 1,
+            "tp_size": 1,
+            "sp_degree": 1,
+            "batching_max_size": 1,
+            "enable_cfg_parallel": False,
+            "enable_torch_compile": False,
+            "enable_breakable_cuda_graph": False,
+            "dit_cpu_offload": False,
+            "text_encoder_cpu_offload": False,
+            "image_encoder_cpu_offload": False,
+            "vae_cpu_offload": False,
+            "dit_layerwise_offload": False,
+            "use_fsdp_inference": False,
+            "warmup_mode": "off",
+        }
+        resolved = ServerArgs.from_kwargs(**kwargs)
+        self.assertTrue(resolved.pipeline_config.enable_und_cache)
+        self.assertIsNone(resolved.cache_dit_config)
+        self.assertFalse(resolved.regional_compile)
+        self.assertFalse(resolved.enable_attention_backend_autotune)
+        for field, value, message in (
+            ("cache_dit_config", {}, "cache_dit_config"),
+            ("regional_compile", True, "regional_compile"),
+            ("enable_attention_backend_autotune", True, "autotuning"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                ServerArgs.from_kwargs(**kwargs, **{field: value})
+
     def test_unsupported_action_fields_fail_instead_of_disappearing(self):
         for parameters in (
             {"action_mode": "policy"},

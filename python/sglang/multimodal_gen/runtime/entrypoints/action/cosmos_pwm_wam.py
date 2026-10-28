@@ -23,6 +23,16 @@ from sglang.multimodal_gen.configs.sample.cosmos_pwm_wam import (
 )
 
 
+def _apply_runtime_und_cache(raw: dict, runtime: dict) -> dict:
+    if "enable_und_cache" in runtime:
+        if "enable_und_cache" in raw:
+            raise ValueError(
+                "enable_und_cache was supplied in both runtime and request"
+            )
+        raw["enable_und_cache"] = runtime["enable_und_cache"]
+    return raw
+
+
 def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
     """Lower native action or original Cosmos input to one WAM request."""
     if not isinstance(payload, dict):
@@ -36,6 +46,7 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
         "return_timing",
         "prefix_cache",
         "cuda_graph",
+        "enable_und_cache",
     }
     if unsupported_runtime:
         raise ValueError(
@@ -44,6 +55,10 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
     for name in ("prefix_cache", "cuda_graph"):
         if runtime.get(name) not in (None, False, "false"):
             raise ValueError(f"Cosmos PWM WAM does not support runtime.{name}")
+    if "enable_und_cache" in runtime and not isinstance(
+        runtime["enable_und_cache"], bool
+    ):
+        raise TypeError("runtime.enable_und_cache must be a boolean")
     if "wam_request" in payload:
         unknown = set(payload) - {"wam_request", "runtime", "model", "id", "request_id"}
         if unknown:
@@ -54,9 +69,11 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
         raw = payload["wam_request"]
         if not isinstance(raw, dict):
             raise ValueError("wam_request must be an object")
-        return copy.deepcopy(raw)
+        return _apply_runtime_und_cache(copy.deepcopy(raw), runtime)
     if "model_mode" in payload:
-        return copy.deepcopy(payload)
+        raw = copy.deepcopy(payload)
+        raw.pop("runtime", None)
+        return _apply_runtime_und_cache(raw, runtime)
 
     unknown = set(payload) - {
         "input",
@@ -116,6 +133,7 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
         "normalize_cfg",
         "guidance_interval",
         "name",
+        "enable_und_cache",
     }
     action_fields = {
         "action_domain",
@@ -152,7 +170,7 @@ def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:
             f"WAM Action128 fields were supplied twice: {sorted(duplicate)}"
         )
     extra.setdefault("action128", {}).update(action128)
-    return raw
+    return _apply_runtime_und_cache(raw, runtime)
 
 
 def build_pwm_wam_action_sampling_params(payload, server_args):
