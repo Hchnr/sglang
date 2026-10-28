@@ -24,6 +24,19 @@
 
 宿主 Python 为 3.12/Torch 2.12 dev，缺少 diffusion 依赖。旁边 native 环境具有 Torch 2.13、Diffusers 0.40、Transformers 5.14.1；与目标仓库声明仍不同。创建独立验证环境或依赖 overlay，记录实际版本和差异，不在 reference/native 环境直接升级包。后续优先尝试目标版本；任何版本限制明确写入结论，不隐藏兼容性缺口。
 
+## 2026-10-28 17:05：原生核心与参考产物
+
+- 新增纯 PyTorch 三塔核心、位置编码、严格分片 loader、兼容 UniPC 和 Wan RMS；生产代码没有 Cosmos/vLLM 导入或外部 worker 转发。
+- loader 对 index/shard/model 的 key、shape、dtype 和路径逐项检查；Action128 的输入与 velocity 屏蔽无效槽位。时间编码常量保持 FP32。
+- 小型三塔在 FP32/BF16、两种 token geometry 下与移植来源的 SDPA 分支逐元素一致。7 项模型合同测试已写入 CPU CI；完整执行待独立依赖环境安装完成，当前只宣称静态 Ruff/AST 与独立核心对照通过。
+- 当前 Cosmos HF reference 已完成 `request_smoke.json`：GPU0、Torch 2.10.0+cu130、BF16/SDPA、3 steps、5 frames、4 actions、256 高画布。保存 `artifacts/pwm_wam_1028/reference_smoke/{response.jsonl,video.npy,stderr.log}`；联合采样日志约 4.27 秒，含首次运行成本，不能作性能结论。
+- 独立 `.venv` 安装期间 Torch 目录尚未写完，过早导入触发系统库/NVSHMEM 混用；暂停使用该环境直到安装完成。共享 NFS 上大型依赖写入耗时，参考环境不受修改。
+- 新增手工验证入口 `test/manual/test_cosmos_pwm_wam.py`，显式接收资产路径，保存无损动作/视频数组、版本、耗时，支持 runtime/Python 两条路径与固定请求重复性、reference 误差报告。私有权重不加入公共 CI。
+
+### 决策 D03：合同正确性优先
+
+先前 native 实现仅在最终返回时清零无效槽位，与当前 Cosmos 的每步 mask 不同。此接入修正初始 noise、模型输入、velocity 和 solver 固定坐标；本次必须重做数值 reference，不能引用历史 native 的通过结论。
+
 ## 进行中的工作
 
 实现与验证尚未完成。每阶段补充改动、命令/结果、失败原因、修正、提交和剩余风险。
