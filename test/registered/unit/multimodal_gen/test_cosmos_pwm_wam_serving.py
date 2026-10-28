@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -225,6 +226,125 @@ class TestCosmosPWMWAMServing(CustomTestCase):
                 )
         with self.assertRaises(TypeError):
             CosmosPWMWAMSamplingParams(enable_und_cache="false")
+
+    def test_python_rejects_unused_controls_before_building_a_worker_request(self):
+        for fields in (
+            {"generator_device": "cpu"},
+            {"save_output": True},
+            {"return_file_paths_only": True},
+            {"max_sequence_length": 8},
+            {"profile": False},
+            {"perf_dump_path": "unused.json"},
+            {"data_type": "video"},
+            {"no_override_protected_fields": True},
+            {"diffusers_kwargs": {}},
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaisesRegex(ValueError, "[Uu]nsupported|does not support"),
+            ):
+                SamplingParams.from_user_sampling_params_args(
+                    str(self.root), self.server_args, wam_request=self.raw, **fields
+                )
+        for fields in (
+            {"width": 999},
+            {"height": 999},
+            {"runtime": {"enable_und_cache": True}},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(TypeError):
+                SamplingParams.from_user_sampling_params_args(
+                    str(self.root), self.server_args, wam_request=self.raw, **fields
+                )
+
+    def test_python_rejects_conflicting_raw_and_convenience_values(self):
+        raw = {**self.raw, "guidance": 3.0, "num_steps": 5}
+        for fields in (
+            {"seed": 19},
+            {"guidance_scale": 5.0},
+            {"num_inference_steps": 7},
+            {"prompt": "A different task"},
+            {"action_fps": 20},
+            {"return_video": True},
+            {"extra": {"action128": {"return_video": True}}},
+            {"prompt_path": str(self.root / "unused.txt")},
+        ):
+            with (
+                self.subTest(fields=fields),
+                self.assertRaisesRegex(
+                    ValueError, "[Cc]onflicting|one Python input source"
+                ),
+            ):
+                SamplingParams.from_user_sampling_params_args(
+                    str(self.root), self.server_args, wam_request=raw, **fields
+                )
+        same = SamplingParams.from_user_sampling_params_args(
+            str(self.root),
+            self.server_args,
+            wam_request=raw,
+            seed=17,
+            guidance_scale=3.0,
+            return_video=False,
+        )
+        self.assertEqual(same.wam_request["seed"], 17)
+        self.assertEqual(same.wam_request["guidance"], 3.0)
+
+    def test_python_convenience_values_are_consumed_and_frozen(self):
+        prompt_path = self.root / "prompt.txt"
+        prompt_path.write_text("Move right")
+        params = SamplingParams.from_user_sampling_params_args(
+            str(self.root),
+            self.server_args,
+            request_id="python-wam",
+            prompt_path=str(prompt_path),
+            vision_path=os.path.relpath(self.root / "input.png"),
+            seed=23,
+            fps=15,
+            action_horizon=100,
+            num_frames=33,
+            image_size=32,
+            num_inference_steps=7,
+            guidance_scale=2.0,
+            flow_shift=5.0,
+            enable_und_cache=True,
+            extra=self.raw["extra"],
+            return_video=False,
+        )
+        expected = params.build_request_extra()
+        raw = expected["cosmos_pwm_wam"]
+        self.assertEqual(params.request_id, "python-wam")
+        self.assertEqual(raw["prompt"], "Move right")
+        self.assertEqual(raw["vision_path"], str(self.root / "input.png"))
+        self.assertEqual(
+            {
+                key: raw[key]
+                for key in (
+                    "seed",
+                    "fps",
+                    "action_chunk_size",
+                    "num_frames",
+                    "image_size",
+                    "num_steps",
+                    "guidance",
+                    "shift",
+                    "enable_und_cache",
+                )
+            },
+            {
+                "seed": 23,
+                "fps": 15,
+                "action_chunk_size": 100,
+                "num_frames": 33,
+                "image_size": 32,
+                "num_steps": 7,
+                "guidance": 2.0,
+                "shift": 5.0,
+                "enable_und_cache": True,
+            },
+        )
+        self.assertFalse(raw["extra"]["action128"]["return_video"])
+        prompt_path.write_text("Changed after admission")
+        params._adjust(self.server_args)
+        self.assertEqual(params.build_request_extra(), expected)
 
     def test_unsupported_optimization_settings_fail_during_server_resolution(self):
         from sglang.multimodal_gen.runtime.server_args import ServerArgs

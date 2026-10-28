@@ -205,7 +205,21 @@ GPU 阶段边界执行同步，因此包含同步成本；不包含排队、HTTP
 原始 WAM 请求可设置 `"enable_und_cache": true` 或 `false`。Python 的
 `CosmosPWMWAMSamplingParams.enable_und_cache=None` 表示继承 pipeline 默认值；
 实际 bool 值在入队前固定。`false` 保留逐步骤重新计算 UND 的基线，供数值对照。
-原生 HTTP 或 `generate_action()` 也接受：
+Python 入口使用直接采样字段：
+
+```python
+result = generator.generate_action({"wam_request": raw, "enable_und_cache": True})
+```
+
+Python 可用 `prompt` / `prompt_path`、`vision_path`、`seed`、`fps`、`action_horizon`、
+`num_frames`、`image_size`、`num_inference_steps`、`guidance_scale`、`flow_shift`、
+Action128 字段和 `extra` 构造请求。与 `wam_request` 重复提供同一值时必须一致；
+`extra` 应从一个来源提供，避免嵌套字段覆盖。未支持的通用控制（如
+`generator_device`、`save_output`、`profile`、`max_sequence_length` 或
+`diffusers_kwargs`）会在入队前报错。`width` / `height` 不是 WAM Python 参数，
+画布尺寸使用 `image_size`。
+
+原生 HTTP 接受以下包装；`runtime` 包装不适用于 Python `generate_action()`：
 
 ```python
 payload = {
