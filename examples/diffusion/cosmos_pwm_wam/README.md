@@ -62,7 +62,9 @@ sglang serve \
   --host 127.0.0.1 --port 30000
 ```
 
-完整模型常驻单张 GPU。启动后用一个真实 WAM 请求完成预热。
+参与 WAM 推理的权重常驻单张 GPU；未使用的文本输出头 `lm_head.weight`
+在完整校验后保留 CPU，仍包含在 `state_dict` 中，不与输入 embedding 绑定。
+启动后用一个真实 WAM 请求完成预热。
 `GET /v1/actions/metadata` 返回该 pipeline 的能力和默认参数。
 
 ## 构造请求
@@ -182,7 +184,11 @@ if __name__ == "__main__":
 `checkpoint_path` 是启动时固定 artifact 的绝对路径；
 `checkpoint_config_sha256` 只标识 config 文件，**不是权重 hash**。
 `contract_fingerprint` 标识 Action128 合同，`loader_info` 记录加载的张量数、分片数
-和字节数。`asset_file_sha256` 记录 VAE 配置与 tokenizer 配置、词表、chat template
+和字节数。其中 `loaded_tensor_bytes` 包含 CPU 文本输出头；
+`cuda_resident_tensor_bytes` 仅统计 CUDA 上的模型 checkpoint 张量，
+`unused_text_head_cpu_bytes` 单列 CPU 文本输出头。这些字段不包含 VAE 权重或推理
+临时张量，不能代替整个 worker 的峰值显存测量。
+`asset_file_sha256` 记录 VAE 配置与 tokenizer 配置、词表、chat template
 文件的摘要，**不包含 VAE 或模型权重**。审计具体权重版本时应另外保留导出 manifest
 和权重校验和。
 

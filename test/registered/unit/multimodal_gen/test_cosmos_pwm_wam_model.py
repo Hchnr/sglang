@@ -12,6 +12,8 @@ from pathlib import Path
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 from safetensors.torch import save_file
+from torch import nn
+
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.positions import (
     position_ids,
 )
@@ -30,7 +32,6 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.vae import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from torch import nn
 
 # CPU tensor tests need the diffusion lane's optional dependencies.
 register_cuda_ci(est_time=8, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
@@ -304,6 +305,10 @@ class TinyArtifactTransformer(PwmWamTransformer):
     def __init__(self, num_domains):
         nn.Module.__init__(self)
         self.projection = nn.Linear(4, 3, bias=False)
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Module()
+        self.language_model.model.embed_tokens = nn.Embedding(3, 4)
+        self.language_model.lm_head = nn.Linear(4, 3, bias=False)
         self.register_buffer("contract_digest", torch.empty(16, dtype=torch.uint8))
 
 
@@ -353,6 +358,14 @@ class TestPwmArtifactValidation(CustomTestCase):
             "model.net.projection.weight": torch.arange(12)
             .reshape(3, 4)
             .to(torch.bfloat16),
+            "model.net.language_model.model.embed_tokens.weight": torch.arange(12)
+            .reshape(3, 4)
+            .to(torch.bfloat16),
+            # Deliberately distinct: the unused head must remain lossless, not
+            # be retied to or substituted for the live embedding table.
+            "model.net.language_model.lm_head.weight": -torch.arange(12)
+            .reshape(3, 4)
+            .to(torch.bfloat16),
             "model.net.contract_digest": torch.arange(16, dtype=torch.uint8),
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -370,6 +383,53 @@ class TestPwmArtifactValidation(CustomTestCase):
                 rtol=0,
             )
             self.assertEqual(model.contract_digest.dtype, torch.uint8)
+            state = model.state_dict()
+            self.assertEqual(
+                set(state), {key.removeprefix("model.net.") for key in tensors}
+            )
+            for name, actual in state.items():
+                torch.testing.assert_close(
+                    actual, tensors["model.net." + name], atol=0, rtol=0
+                )
+            self.assertNotEqual(
+                model.language_model.lm_head.weight.data_ptr(),
+                model.language_model.model.embed_tokens.weight.data_ptr(),
+            )
+            self.assertEqual(model.load_info["loaded_tensor_bytes"], 88)
+            self.assertEqual(model.load_info["cuda_resident_tensor_bytes"], 0)
+            self.assertEqual(model.load_info["unused_text_head_cpu_bytes"], 24)
+
+            # Meta is a non-CPU destination available in the CPU lane. This
+            # catches accidentally retaining the used embedding on CPU along
+            # with the text head, without requiring a GPU allocation.
+            placed = TinyArtifactTransformer.from_pretrained(root, device="meta")
+            self.assertEqual(placed.language_model.lm_head.weight.device.type, "cpu")
+            self.assertEqual(
+                placed.language_model.model.embed_tokens.weight.device.type, "meta"
+            )
+            self.assertEqual(placed.projection.weight.device.type, "meta")
+            self.assertEqual(placed.load_info["cuda_resident_tensor_bytes"], 0)
+            torch.testing.assert_close(
+                placed.language_model.lm_head.weight,
+                tensors["model.net.language_model.lm_head.weight"],
+                atol=0,
+                rtol=0,
+            )
+
+            for invalid, error in (
+                (torch.zeros(3, 4), "must be BF16"),
+                (torch.zeros(4, 3, dtype=torch.bfloat16), "HF shape mismatch"),
+            ):
+                save_file(
+                    {**tensors, "model.net.language_model.lm_head.weight": invalid},
+                    root / "weights.safetensors",
+                )
+                with (
+                    self.subTest(unused_head_error=error),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    TinyArtifactTransformer.from_pretrained(root, device="cpu")
+            save_file(tensors, root / "weights.safetensors")
             for section, name, value in (
                 ("vlm_config", "use_system_prompt", True),
                 ("vlm_config", "model_name", "Qwen/another-model"),

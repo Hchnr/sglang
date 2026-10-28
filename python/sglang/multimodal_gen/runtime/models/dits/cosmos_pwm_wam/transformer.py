@@ -427,6 +427,8 @@ class PwmWamTransformer(nn.Module):
             raise ValueError("PWM shard index must contain filenames")
         shards = sorted(set(source.values()))
         loaded_bytes = 0
+        cuda_resident_bytes = 0
+        unused_text_head_cpu_bytes = 0
         for shard in shards:
             shard_path = (path / shard).resolve()
             if not shard_path.is_relative_to(path):
@@ -458,7 +460,12 @@ class PwmWamTransformer(nn.Module):
                         )
                         if not legacy_transform or value.dtype != torch.bfloat16:
                             raise ValueError(f"PWM buffer dtype mismatch for {name}")
-                    value = value.to(device=device, dtype=target_dtype)
+                    # WAM never emits text logits. Preserve this independent
+                    # parameter and its full validation/state_dict coverage on
+                    # CPU without transferring an unused vocabulary matrix.
+                    unused_text_head = name == "language_model.lm_head.weight"
+                    target_device = "cpu" if unused_text_head else device
+                    value = value.to(device=target_device, dtype=target_dtype)
                     owner, _, leaf = name.rpartition(".")
                     module = model.get_submodule(owner) if owner else model
                     setattr(
@@ -470,12 +477,19 @@ class PwmWamTransformer(nn.Module):
                             else value
                         ),
                     )
-                    loaded_bytes += value.numel() * value.element_size()
+                    tensor_bytes = value.numel() * value.element_size()
+                    loaded_bytes += tensor_bytes
+                    if value.device.type == "cuda":
+                        cuda_resident_bytes += tensor_bytes
+                    if unused_text_head:
+                        unused_text_head_cpu_bytes += tensor_bytes
         model.load_info = {
             "mode": load_mode,
             "tensor_count": len(source),
             "shard_count": len(shards),
             "loaded_tensor_bytes": loaded_bytes,
+            "cuda_resident_tensor_bytes": cuda_resident_bytes,
+            "unused_text_head_cpu_bytes": unused_text_head_cpu_bytes,
         }
         return model.eval()
 

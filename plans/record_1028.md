@@ -149,3 +149,12 @@ GPU0 初查空闲，导入期间外部任务占约 50 GB，第一次诊断加载
 - 本组运行加载的是 `4736596b7c`；监督器确认目标 GPU 仅有该推理进程，无外部进程冲突，退出码 0。完整命令、GPU 审计、12 份输出、两份 trace 和统计保存在 `und_cache_validation/`。没有根据带 profiler 的耗时计算提速。
 - 使用 `llm-torch-profiler-analysis` 的单 trace 分析整理两条 native trace。算子表显示 GEMM 38.16%、cuDNN attention 28.08%，余下主要为逐元素、cast 和 norm。自动分析器把 `nvjet` 模式提示为 FP8 替换候选，但本模型实际 BF16，**该提示不适用**；未据此引入量化或声称可直接复用 FP8 kernel。单 trace 不能建立可重叠执行的收益结论。
 - 多场景 cache-on 视频与真实 Python/HTTP/facade 验证、未使用文本输出头的 CPU 常驻显存实测继续进行。仍不声称已超过当前 Cosmos FA3+compile 基线。
+
+## 2026-10-28：未使用文本输出头的独立显存验证
+
+- WAM 不生成文本 logits。严格 loader 继续校验并保留独立的 `language_model.lm_head.weight`，仅将它留在 CPU；没有删除 key、留下 meta 参数或与实际使用的 embedding 绑定。全部 1,214 个 checkpoint 张量及完整 `state_dict` 仍保留，参与 WAM 推理的参数均在 CUDA。UND 缓存数学路径及默认关闭策略不变。
+- `loaded_tensor_bytes` 仍表示全部加载张量，共 32,364,191,504 bytes；新增 `cuda_resident_tensor_bytes=31,119,531,792` 与 `unused_text_head_cpu_bytes=1,244,659,712`。实际 CUDA checkpoint 权重精确减少 **1,244,659,712 bytes（1.1591796875 GiB）**，不是按权重文件大小估算。VAE 与激活不计入这些模型加载字段。
+- GPU3/H10080GB 一次加载执行现有手工 harness：`--route runtime --und-cache compare --warmup 1 --repeat 1`，无 profiler。输入为既有 `benchmark/request.json`（Libero 960×640、40 actions、41 frames、5 steps、CFG1.5、shift5、seed42、无视频 decode）。四次 off/on/on/off 的全宽 `[40,128]` physical/normalized arrays 均与 `4736596b7c` 的匹配 ABBA 输出逐元素一致，离散合同相等，inactive 槽位全部为零。本项没有比较 decoded 视频。
+- 峰值 allocated：cache off 33,523,971,072 bytes，on 33,560,925,184 bytes。相对之前 GPU2 的匹配输出，均减少 1,245,708,288 bytes，即文本头大小再加 1 MiB。额外 1 MiB 是本次跨 GPU 运行的分配差异，未归因于模型权重；也不根据一轮跨卡测量宣称延迟收益。
+- 设备审计包装器只在原 runtime 初始化返回后读取参数设备、字节数和加载信息，然后恢复原初始化函数；没有修改权重或 forward。全 runtime（含 VAE）只有该文本头参数位于 CPU，其余参数均 CUDA。成功进程的 namespace PID2972677 对应 NVML PID721834；监督器未发现该卡第二进程，退出码 0，GPU3 已释放。首次尝试因 PID 命名空间映射被自己的监督器误判并停止，尚无推理输出，保留在 `unused_head_cpu_validation/attempt_01_pid_namespace/`；未停止其他任务。
+- 复现命令、git/diff/source SHA、初始化设备明细、峰值与全部四份输出位于 `artifacts/pwm_wam_1028/unused_head_cpu_validation/`；`comparison.json` 分开记录权重减少量与实际峰值减少量。模型 CPU 单测 9/9 通过（0.548 s），新增检查覆盖完整 state_dict 无损/不绑定、used embedding 仍去指定设备、CPU head 的 shape/dtype 损坏仍拒绝，以及加载字节分类。仓库 isort、选定 Ruff 规则、format 和 diff 检查通过。
