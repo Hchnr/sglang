@@ -158,3 +158,21 @@ GPU0 初查空闲，导入期间外部任务占约 50 GB，第一次诊断加载
 - 峰值 allocated：cache off 33,523,971,072 bytes，on 33,560,925,184 bytes。相对之前 GPU2 的匹配输出，均减少 1,245,708,288 bytes，即文本头大小再加 1 MiB。额外 1 MiB 是本次跨 GPU 运行的分配差异，未归因于模型权重；也不根据一轮跨卡测量宣称延迟收益。
 - 设备审计包装器只在原 runtime 初始化返回后读取参数设备、字节数和加载信息，然后恢复原初始化函数；没有修改权重或 forward。全 runtime（含 VAE）只有该文本头参数位于 CPU，其余参数均 CUDA。成功进程的 namespace PID2972677 对应 NVML PID721834；监督器未发现该卡第二进程，退出码 0，GPU3 已释放。首次尝试因 PID 命名空间映射被自己的监督器误判并停止，尚无推理输出，保留在 `unused_head_cpu_validation/attempt_01_pid_namespace/`；未停止其他任务。
 - 复现命令、git/diff/source SHA、初始化设备明细、峰值与全部四份输出位于 `artifacts/pwm_wam_1028/unused_head_cpu_validation/`；`comparison.json` 分开记录权重减少量与实际峰值减少量。模型 CPU 单测 9/9 通过（0.548 s），新增检查覆盖完整 state_dict 无损/不绑定、used embedding 仍去指定设备、CPU head 的 shape/dtype 损坏仍拒绝，以及加载字节分类。仓库 isort、选定 Ruff 规则、format 和 diff 检查通过。
+
+## 2026-10-28 19:15：完整回归、服务对照与最终审查
+
+- 六个目标环境场景完成24次off/on/on/off rollout，54组全宽physical/normalized/video比较全部exact；source leaf前后SHA一致。证据 `und_cache_matrix/{summary,acceptance}.json`。Python真实worker四次、native HTTP四次、compat三次也通过开关及继承参数验证，11组动作数组与先前最终结果一致，7份MP4逐字节一致，下载/删除/404及服务关闭清理成功；证据 `und_cache_serving/cross_route_summary.json` 和两入口各自 `shutdown.json`。
+- 短请求质量矩阵单组ABBA出现缓存慢17%的波动，没有删掉该数据。为解决此疑点，GPU1对同一3-step带视频smoke每mode预热3次，再执行5组ABBA。off十次平均0.313904 s、on十次平均0.272644 s，改善13.1443%；全部动作、normalized和uint8视频exact。目标卡无外部并发，进程正常退出；证据 `und_cache_short_request/comparison.json`。默认缓存仍关闭，部署可显式开启，不外推所有请求的提速比例。
+- 最终优化后的新增CPU回归38/38通过；已有Pi05、Cosmos3、registry使用pytest完整运行，163 passed、59 subtests passed。先前用unittest尝试收集pytest函数返回“0 tests”，不计为通过；已用正确runner重跑。日志 `final_cpu_optimized.log`、`final_existing_optimized.log`。
+- 28份Python文件通过仓库pre-commit选定Ruff规则F401/F821/F823/UP037、format、isort与diff检查。全规则Ruff最初还报告已有registry旧typing以及与独立isort配置的排序差异，没有为了此任务重构无关代码；实际hook结果在 `final_optimized_hooks.log`，原完整诊断也保留。
+- Cosmos外部HEAD在验证期间推进：初始3d2aba，fresh smoke manifest明确42bea124；早期六场景缺逐run commit stamp，不能全归属初始HEAD。只读审计保存20份关键文件blob/SHA与相关源码树等值证据，变化是未调用服务优化/诊断工具。stderr+reflog的逐场景revision归属只标“重建”，证据在 `same_environment/source_revision_audit.json`，说明提交455d63f168。没有修改或回退外部checkout。
+
+### 决策 D10：保留完整权重审计，只让未使用文本头留在CPU
+
+显存优化独立提交29495faae6，全部checkpoint张量仍严格检查，只有WAM不计算的独立lm_head留CPU；不绑embedding、不改变网络精度。精确CUDA权重减少量与跨卡峰值分配差异分开报告。UND缓存仍是显式opt-in，保留直接数值基线。
+
+### 决策 D11：修复最终审查发现的Python参数合同缺口
+
+HTTP adapter已有白名单，但Python generate_action直接创建模型sampling params。ActionSamplingParams中generator_device/save_output/return_file_paths_only/max_sequence_length等字段此前可被接受却不进入WAM推理，raw与外层显式seed/guidance等冲突也可能被setdefault静默忽略。width/height/runtime并非该独立dataclass字段，本来会TypeError，最初审查推断已纠正。README一处runtime.enable_und_cache包装适用于HTTP，Python应使用直接采样字段。
+
+由WAM sampling层基于显式传参来源拒绝不支持字段和双来源冲突，检查factory单独处理的diffusers_kwargs；不改通用action模型行为。不改变数学路径，已完成GPU数值证据继续有效；补定点CPU负例、有效参数正例及一次真实Pythonworker验证。完整目标在修复和复核完成前保持active。

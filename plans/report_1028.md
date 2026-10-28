@@ -1,6 +1,6 @@
 # 三塔 PWM WAM 接入 SGLang：结论
 
-更新（18:55）：同环境六场景原像素对照已完成，动作和视频全部逐位一致；请求内 UND 缓存的无视频 ABBA 实测平均延迟下降 3.15%。缓存开启后的多场景视频、服务验证及显存优化仍在进行。
+更新（19:15）：同环境六场景原像素对照、目标环境缓存矩阵及三入口复测均完成，动作和视频逐位一致。UND 缓存实测延迟下降 3.15%（原尺寸无视频 decode）和 13.14%（带视频短请求）；GPU 模型权重减少 1.159 GiB。最终审查发现 Python 入口部分继承字段未消费、显式字段与 raw 冲突会被静默忽略，正在补严格校验和定点验证，尚未将完整目标标为完成。
 
 原生接入与功能验证已完成：真实 checkpoint 由 SGLang worker 直接执行 UND、VIDEO、ACTION 三塔及联合 UniPC，Python、原生 action HTTP 和 Cosmos `/generate` 兼容入口均可交付动作及可选视频。
 
@@ -14,7 +14,7 @@
 - 已适配固定 HF artifact、原生三塔、SGLang worker/API，修正与当前 Cosmos 的过程 mask、媒体和 seed 差异；复用代码保留来源归属。
 - 已实现 `CosmosPWMWAMPipeline`，在 SGLang worker 内直接执行三塔和联合采样。生产代码无 Cosmos/vLLM import 或外部推理进程转发。
 - Python `generate_action()`、原生 `/v1/actions/generations`、独立 Cosmos `/generate` facade 均已真实跑通，动作与可选视频可以交付。
-- 隔离环境采用仓库目标 Torch 2.14.1、Transformers 5.19.0、Diffusers 0.37.0；source reference 为当前 Cosmos `3d2aba0fe5e293f505d7ec52cb6b2eba8cc95d06`、Torch 2.10.0/cuDNN 9.15.1.9。目标 cuDNN 为 9.24.0.43。
+- 隔离环境采用仓库目标 Torch 2.14.1、Transformers 5.19.0、Diffusers 0.37.0，目标 cuDNN 为 9.24.0.43；source 使用 Torch 2.10.0/cuDNN 9.15.1.9。Cosmos 初始 revision 为 `3d2aba0f`，外部开发期间推进到 fresh smoke 使用的 `42bea124`。早期六场景未各自记录 commit，只能按日志/reflog重建；相关实际数值调用路径源码等值，具体证据和局限见下文，不把所有运行伪称为同一 HEAD。
 - 7 个分片、1,214 个模型 tensor 严格加载；tensor bytes 32,364,191,504，分片文件 bytes 32,364,372,752，已保存全部 SHA-256。
 - 使用固定 `../vllm-omni-pwm/artifacts/pwm-wam-hf`（来源 iter_000008600），VAE `/share/project/eai_pwm/models/Cosmos3-Nano/vae`，tokenizer `/share/project/eai_pwm/models/Cosmos3-Nano-VLM`。未重新导出、覆盖资产或选择训练 latest。
 
@@ -27,20 +27,24 @@ Review 可从 [pipeline](../python/sglang/multimodal_gen/runtime/pipelines/cosmo
 | 严格权重加载与合同验证 | 实权重成功；shape/dtype/索引/合同/资产/registry 负例已测试 |
 | 原生三塔和联合 UniPC | 同环境六场景原始像素输入：全宽动作、normalized actions、视频逐位一致；fresh smoke 生成坐标全轨迹一致，固定条件帧末位差异见下文 |
 | 新增 CPU 测试 | 38/38：9 model +17 runtime +12 serving |
-| 既有回归 | Pi05 API 10、Cosmos3 相关 18 +4 subtests、registry 11 均通过 |
+| 既有完整回归 | Pi05 API、Cosmos3、registry 全套 pytest：163 passed，59 subtests passed |
 | 目标环境对当前 Cosmos 原始像素 e2e | 七请求/六场景完成，shape/离散合同一致、inactive 槽位零、输出有限；每帧视频质量通过，跨环境 strict bitwise 不成立 |
 | SGLang worker / Python / HTTP | 最终三入口动作逐值一致，13 项 metadata/资产摘要相同；原生与 facade MP4 逐字节一致（86,268 bytes） |
 | 错误与生命周期 | 原生 400/facade 422 后恢复；四并发 1×200+3×503、Retry-After=1 后恢复；下载/删除/404、SIGTERM 文件和目录清理通过 |
 | 状态隔离 | Libero → 多 domain/shape/seed → Libero，动作/normalized actions/视频首尾逐元素一致 |
+| 请求内 UND 缓存 | 目标环境六场景×off/on/on/off，共24次 rollout；54组完整动作/normalized/video数组比较全部 exact |
+| 显存优化 | 1214个checkpoint张量完整保留，used权重CUDA、unused文本头CPU；CUDA权重精确减少1,244,659,712 bytes，真实输出与优化前一致 |
 | 性能与显存基线 | 同卡重复 Cosmos SDPA /FA3+compile /SGLang Python 完成，见下文 |
 | 部署文档与可复现命令 | [部署说明](../examples/diffusion/cosmos_pwm_wam/README.md) 已提供并实际启动验证 |
-| 静态检查 | 22 份新 Python 文件 Ruff、format、isort 通过，`git diff --check` 干净 |
+| 静态检查 | 28份新增或修改的Python文件通过仓库pre-commit选定Ruff规则、format、isort；`git diff --check` 干净 |
 
 三份单元测试在 CPU 张量上执行，但依赖 Diffusers。既有 hosted CPU CI 只安装 `python[dev]`，因此注册到已有安装 diffusion 依赖的 `base-b-test-diffusion-unit-1-gpu-h100`。CI discovery/validation/filter 已确认三文件均启用、无 skip；没有增加全局 CPU 依赖。私有 checkpoint 不加入公共 CI。
 
 ## 数值结论与边界
 
 当前 Cosmos 和 native leaf snapshot 在相同 Python 3.13 / Torch 2.10 / cuDNN 9.15 下，六种原始像素输入的全宽 Action128、normalized actions、无损 uint8 视频全部逐位一致，max abs=0。该实验没有注入 reference latent。诊断加载器只跳过无关 serving 包初始化，实际计算文件是记录 SHA-256 的原生 snapshot；它证明移植语义，不替代目标 Torch 2.14 的 SGLang worker 验证。
+
+正确性 reference 选择 eager SDPA；FA3+compile 是单独性能对照，未宣称其与 SDPA 逐位一致。Cosmos HEAD 在任务期间有外部提交，最新 smoke 的 manifest 明确记录 `42bea124`。对初始与后续相关 revision 的只读审计确认 model/data/configs/utils、实际 inference entrypoint/args/defaults/action_serving 未变化，20个关键文件 blob/SHA-256 一致；变化集中在未调用的服务优化及诊断工具。早期各场景 revision 的归属由 stderr 时间与 reflog 重建，证据强度低于逐运行 manifest，详见 [source_revision_audit.json](../artifacts/pwm_wam_1028/same_environment/source_revision_audit.json)。
 
 另外重新捕获的 smoke 逐步对照有 52 个边界、49 个整张量 exact；另三个张量只在固定条件帧的 812 个坐标上有 max abs `1.1920929e-7`，**生成视频和动作坐标的差异为零**。native 每步恢复固定坐标为 clean，而 source solver 在这些坐标保留 FP32 舍入；不把这三张量标为 exact。完整方法和证据索引见 [数值验证说明](../test/manual/pwm_wam_validation_notes.md)。
 
@@ -78,6 +82,10 @@ VAE 首差异出现在同值、同 shape/stride/NCDHW layout 的 BF16 residual c
 
 新增请求内 UND 缓存采用同 GPU2 的三组 ABBA，固定上述 workload、各模式预热一次，正式样本每种 6 次。未缓存平均 **3.257093 s**，缓存平均 **3.154454 s**，平均延迟下降 **3.1512%**；两者 median 分别为 3.244553 /3.154283 s。12 次动作/normalized actions 全部逐元素一致；另两次 profiler 输出也一致，profile 耗时不计入统计。缓存额外峰值 allocated 为 **36,954,112 bytes**。监督日志确认测试 GPU 没有外部并发，命令、输出、trace 与汇总见 [und_cache_validation/comparison.json](../artifacts/pwm_wam_1028/und_cache_validation/comparison.json)。这组测量基于 `4736596b7c`，不包含后续 CPU 文本头显存优化，也不表示超过 Cosmos FA3+compile。
 
+另测短 smoke（3 steps、CFG1、4 actions/5帧、带视频 decode）：GPU1、每种模式预热3次，5组ABBA，每种10个样本。off平均 **0.313904 s**，on平均 **0.272644 s**，延迟下降 **13.1443%**；动作、normalized actions和视频全部 exact。该版本包含CPU文本头优化，两组采用相同权重布局；计时仍不含加载、MP4和HTTP。前一轮质量矩阵的单组smoke曾出现缓存慢17%的波动，因此补了本轮重复验证，没有删除先前样本；单轮矩阵不作为性能结论。完整数据见 [und_cache_short_request/comparison.json](../artifacts/pwm_wam_1028/und_cache_short_request/comparison.json)。缓存收益依赖请求，默认仍关闭，可显式开启。
+
+独立显存优化将未使用的 `language_model.lm_head.weight` 保留在CPU，所有key/shape/dtype和数值继续严格检查；不删除参数、不绑定embedding、不改变推理计算。模型加载总字节仍为32,364,191,504，CUDA部分31,119,531,792，精确减少 **1,244,659,712 bytes（1.159 GiB）**。GPU3的匹配ABBA全宽动作与旧基线exact；cache-off/on峰值allocated分别为 **33,523,971,072 /33,560,925,184 bytes**。跨卡峰值比旧结果额外少1 MiB，这部分未归因于权重，也未据此声称延迟收益。加载字段不含VAE和激活，设备明细与对照见 [unused_head_cpu_validation/comparison.json](../artifacts/pwm_wam_1028/unused_head_cpu_validation/comparison.json)。
+
 缓存 trace 的 self CUDA 时间主要为 GEMM 38.16%、cuDNN attention 28.08%，其余为逐元素、cast、norm 等。单 trace 未建立 overlap 收益；自动分析器基于 `nvjet` 名称给出的 FP8 提示不适用于本 BF16 模型。已保留未缓存 trace、缓存 trace、算子表和三表分析，后续 FA3/compile/norm/RoPE 优化应逐项验证舍入、完整动作与视频，不能直接套用其他模型的融合。
 
 这是共享节点上的小样本基线，没有锁定整机独占资源，也没有置信区间/统计显著性结论。收尾时其他 GPU 作业已出现，未操作这些外部进程。
@@ -90,7 +98,9 @@ VAE 首差异出现在同值、同 shape/stride/NCDHW layout 的 BF16 residual c
 
 ## 范围、环境与复现
 
-暂不支持其他 action 模式、state/action 条件输入、多候选、动态 batching、TP/SP/DP/CFG 并行、offload、量化、LoRA、compile、CUDA graph、prefix cache、realtime/OpenPI WebSocket；不支持的控制明确拒绝。上述优化属于原计划 P6，不计入首版完成范围。
+支持范围为固定三塔 `width_only_1b` WAM、单GPU/B1、BF16网络/FP32联合采样、Action128动作及可选视频。请求内UND缓存默认关闭，显式true开启；缓存仅在同一请求的同一CFG分支复用，失败或结束即释放，false保留未缓存数值基线。未使用文本输出头在CPU，参与推理的权重常驻GPU。
+
+暂不支持其他 action 模式、state/action 条件输入、多候选、动态 batching、TP/SP/DP/CFG 并行、动态offload、量化、LoRA、compile、CUDA graph、跨请求prefix cache、realtime/OpenPI WebSocket；不支持的控制明确拒绝。本轮完成请求内复用和显存优化，其余能力按实际需求另行扩展，没有改变步数、分辨率、CFG或量化精度换取速度。
 
 本仓库 `.venv` 安装目标核心包，并通过 `pwm_validation_base.pth` 只读追加相邻环境的第三方 site-packages（如 msgspec、FastAPI、uvicorn）。没有追加 Cosmos/vLLM 仓库源码或修改其环境。**这次不是干净容器安装验证**；主要版本/路径见 `environment.json`，完整 294 项首选 distribution 见 `environment_all_packages.json`。命令清空 `LD_LIBRARY_PATH` 避免宿主 Torch 库混入。服务返回的九份资产摘要只覆盖 VAE 配置/tokenizer 文件，不包含模型/VAE 权重。
 
@@ -100,6 +110,12 @@ CPU 回归命令：
 env -u CUDA_VISIBLE_DEVICES LD_LIBRARY_PATH='' PYTHONPATH=python \
   .venv/bin/python -m unittest discover \
   -s test/registered/unit/multimodal_gen -p 'test_cosmos_pwm_wam_*.py' -v
+
+env -u CUDA_VISIBLE_DEVICES LD_LIBRARY_PATH='' PYTHONPATH=python \
+  .venv/bin/python -m pytest -q \
+  python/sglang/multimodal_gen/test/unit/test_pi05_action_api.py \
+  python/sglang/multimodal_gen/test/unit/test_cosmos3.py \
+  python/sglang/multimodal_gen/test/unit/test_registry.py
 ```
 
 实权重 Python benchmark（输出目录须尚不存在）：
@@ -115,6 +131,8 @@ env LD_LIBRARY_PATH='' PYTHONPATH=python CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=
 ```
 
 重复 `--request` 可跑多场景；`--route runtime` 测直接调用与实际 GPU allocator 统计；`--reference` 比较已有输出。HTTP 启动脚本、测试脚本及关闭检查见 [HTTP 复现说明](../artifacts/pwm_wam_1028/http_validation/REPRODUCE.md)。source 工具只在离线验证中显式导入当前 Cosmos，不属于生产依赖。
+
+缓存ABBA复现：将上述命令改为 `--route runtime --und-cache compare --warmup 1 --repeat 3`，使用新的输出目录；额外 `--profile` 在正式计时之后为两种模式各保存一份trace，并比较其输出。请求必须固定seed。正式性能数据还设置 `FLASHINFER_DISABLE_VERSION_CHECK=1`、`SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1`；各实验的完整argv和环境均在对应artifact目录保存。
 
 ## 已保留的复现材料
 
