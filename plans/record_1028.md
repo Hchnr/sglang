@@ -50,6 +50,16 @@
 
 ### 决策 D04：保留原生入口与薄兼容服务
 
-提供 SGLang `generate_action` 和 `/v1/actions/generate`，另以独立 `pwm_compat` 进程保留 Cosmos `/generate`、`/models`、`/info`、`/domains`、`/healthz`、`/outputs` 形状；全部通过同一原生 SGLang worker，不调用 Cosmos 服务。视频临时附件限定随机 ID、最多 128 个、保留一小时，正常退出清理。兼容层不复制 Cosmos 全部 defaults/output 持久化系统，差异在部署说明中列明。
+提供 SGLang `generate_action` 和 `/v1/actions/generations`，另以独立 `pwm_compat` 进程保留 Cosmos `/generate`、`/models`、`/info`、`/domains`、`/healthz`、`/outputs` 形状；全部通过同一原生 SGLang worker，不调用 Cosmos 服务。原生 action 输入错误沿用 400，兼容入口 422。视频临时附件限定随机 ID、最多 128 个、保留一小时，正常退出清理。兼容层不复制 Cosmos 全部 defaults/output 持久化系统，差异在部署说明中列明。
+
+## 2026-10-28 17:24：CPU 回归与第一轮实权重结果
+
+- 请求/采样提交：`629925c278`。
+- CPU：模型 7/7、runtime 10/10、新服务/registry/兼容层 6/6；现有 Pi05 API 10/10、Cosmos3 相关 18 tests +4 subtests、registry 11/11。没有用 mock 代替三塔数值测试；HTTP 单元测试仅 mock 外部调度与编码边界。
+- 测试必须 `env -u CUDA_VISIBLE_DEVICES LD_LIBRARY_PATH='' PYTHONPATH=python ...`：既有 `test_utils.py` 对空 CUDA_VISIBLE_DEVICES 使用 `[0]`，因此不能设为空字符串；测试本身显式使用 CPU 张量。
+- 实权重 runtime smoke 在目标 Torch 2.14.1 成功，重复请求的动作与原始视频逐元素一致。加载 11.23 s；冷请求 4.628 s；第二次 0.320 s（sample 0.274 s），峰值 allocated 34.36 GB。仅是 256 高、4 action、5 frame、3 step 的小请求，不外推真实部署性能。
+- 对当前 Cosmos/Torch 2.10 smoke：active physical max abs 0.015625、MAE 0.002693、relative L2 0.008685；normalized relative L2 0.009665；uint8 video MAE 1.358、RMSE 6.556、max abs 128。**尚不判数值验收通过**，正在定位首个中间量分歧与跨版本 BF16 影响。
+- 证据：`artifacts/pwm_wam_1028/native_smoke_v2/summary.json`、`000/arrays.npz`、`001/arrays.npz`。当前 Cosmos 分层捕获已成功，失败原因是继承的 LD_LIBRARY_PATH 混入系统 Torch 库；清空后同 GPU BF16 linear 与完整捕获均成功。
+- 真实 SGLang Python worker、native HTTP 与兼容 HTTP 正在分别验证，不将内核 runtime 成功当作服务接入完成。
 
 实现与验证尚未完成。每阶段补充改动、命令/结果、失败原因、修正、提交和剩余风险。

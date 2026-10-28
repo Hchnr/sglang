@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_pwm_wam import (
+    is_cosmos_pwm_wam_package,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
     FLUX3_ACTION_HF_PATHS,
     is_flux3_action_package,
@@ -436,6 +439,10 @@ def _get_config_info(
     _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
+    if is_cosmos_pwm_wam_package(model_path):
+        config_cls, sampling_cls = get_pipeline_config_classes("CosmosPWMWAMPipeline")
+        return ConfigInfo(sampling_cls, config_cls)
+
     # 0. Explicit model_id override: match by short name
     if model_id is not None:
         model_id_lower = model_id.lower()
@@ -722,6 +729,8 @@ def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
+    if is_cosmos_pwm_wam_package(model_path):
+        return "CosmosPWMWAMPipeline"
     if is_sensenova_u1_model(model_path):
         return "SenseNovaU1Pipeline"
     if is_flux3_action_package(model_path):

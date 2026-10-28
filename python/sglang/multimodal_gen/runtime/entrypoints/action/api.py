@@ -5,10 +5,16 @@ from __future__ import annotations
 import json
 import os
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import FileResponse
 
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_pwm_wam import (
+    CosmosPWMWAMPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
@@ -215,8 +221,13 @@ async def create_action_generation(request: Request):
             wants_msgpack = _wants_msgpack(request)
             if wants_msgpack:
                 _prefer_numpy_output(payload)
+            response_format = _response_format(payload)
             output = await infer_action(payload, server_args)
-            if _response_format(payload) == "raw":
+            if isinstance(server_args.pipeline_config, CosmosPWMWAMPipelineConfig):
+                output = await run_in_threadpool(
+                    _wam_video_store(request).save_output, output
+                )
+            if response_format == "raw":
                 response = action_raw_response(output, preserve_numpy=wants_msgpack)
             else:
                 response = action_generation_response(
@@ -224,7 +235,7 @@ async def create_action_generation(request: Request):
                     server_args,
                     preserve_numpy=wants_msgpack,
                 )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if wants_msgpack:
         return Response(
@@ -238,9 +249,54 @@ async def action_metadata_endpoint(request: Request):
     return orjson_response(action_metadata(request.app.state.server_args))
 
 
+def _wam_video_store(request: Request):
+    from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
+        ActionVideoStore,
+    )
+
+    # Starlette State is an open application-owned extension namespace.
+    store = getattr(request.app.state, "pwm_wam_video_store", None)
+    if store is None:
+        server_args = request.app.state.server_args
+        if not isinstance(server_args.pipeline_config, CosmosPWMWAMPipelineConfig):
+            raise HTTPException(
+                status_code=404, detail="WAM video attachments unavailable"
+            )
+        store = ActionVideoStore(Path(server_args.output_path or "outputs"))
+        request.app.state.pwm_wam_video_store = store
+    return store
+
+
+@router.get("/videos/{video_id}/content")
+async def action_video_content(video_id: str, request: Request):
+    try:
+        path = _wam_video_store(request).resolve(video_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="Video expired or not found"
+        ) from exc
+    return FileResponse(path, media_type="video/mp4", filename=f"{video_id}.mp4")
+
+
+@router.delete("/videos/{video_id}")
+async def delete_action_video(video_id: str, request: Request):
+    try:
+        _wam_video_store(request).delete(video_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail="Video expired or not found"
+        ) from exc
+    return {"id": video_id, "deleted": True}
+
+
 @router.websocket("/realtime")
 async def action_realtime_ws(websocket: WebSocket):
     server_args: ServerArgs = websocket.app.state.server_args
+    if isinstance(server_args.pipeline_config, CosmosPWMWAMPipelineConfig):
+        await websocket.close(
+            code=1008, reason="Cosmos PWM WAM uses HTTP action requests"
+        )
+        return
     await run_action_msgpack_ws(
         websocket,
         server_args,
