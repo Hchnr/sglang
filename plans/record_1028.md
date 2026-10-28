@@ -83,3 +83,14 @@ VAE 仍有独立偏差：pixels、首卷积、norm1、SiLU 相同，首次分歧
 GPU0 后续出现本 namespace 不可见的外部 PID 329992，占约 45 GB，不操作它。主验证转 GPU2，分层诊断 GPU1、HTTP GPU3。
 
 GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5、无视频解码，metadata reuse 开启）：六次请求排除首轮后，SDPA median 3.430 s；FA3+compile median 2.233 s，首次 21.835 s 含编译。等待最终 SGLang 同卡测量；不宣称接入即提速。基线日志与响应位于 `artifacts/pwm_wam_1028/benchmark/`。
+
+## 2026-10-28 17:56：数值诊断收敛与最后一轮验证
+
+- 修复/文档提交 `a2dd639bda`。新增四个独立 manual 诊断工具，Ruff/check/format 全通过：source 捕获、native 中间量比较、纯 layer 回放、纯 VAE 回放。它们明确区分实际像素端到端与诊断用 reference-clean 注入，不进入生产依赖。
+- VAE 首差异确认为同值、同 shape/stride、同 contiguous NCDHW input/weight 的早期 BF16 conv1；首卷积、norm、SiLU 均精确一致。该单卷积 283 个元素不同，max abs 0.0078125。benchmark/deterministic/TF32/layout 控制没有消除差异，不据此改全局设置或放宽验收阈值。
+- source clean latent 注入后：首 velocity、layer 0/35 的三塔输入/输出、最终物理/normalized actions 均逐元素一致；最终 video latent max abs 1.192e-7、relative L2 1.49e-8。相同 latent 的 decode uint8 MAE 0.07887、max abs 3，仍显示 VAE 环境差异。**这是隔离验证，不是原始像素 e2e strict parity 通过。**
+- source/target VAE-only 证据分别为 `vae_layout_torch210` / `vae_layout_torch214`，cuDNN 91501 / 92400。目标 Torch 编译要求 cuDNN 9.24，不强行注入旧 9.15 库。详细命令与限制见 `artifacts/pwm_wam_1028/numerical_diagnosis.md`。
+- 七个权重分片 SHA-256 审计完成：总计 32,364,372,752 bytes，文件 `artifacts/pwm_wam_1028/weight_sha256.json`；实际依赖位置/版本在 `environment.json`。独立环境 python-dateutil 已从 3.0 调整为仓库要求的 2.9.0.post0。
+- 最终审查补启动资产/配置 guards，避免错误 VAE/tokenizer、改变的推理配置或越界 projection ID 静默进入 GPU；资产配置 hash 不等同于完整权重绑定。
+- 视频下载用锁内打开的句柄，避免下载与 DELETE/过期清理竞态；正常发送、未开始 body 即取消、ASGI send 异常均验证句柄关闭，已打开后删除仍能读完，新 GET 返回 404。服务 CPU 更新为 9/9。
+- 最后 GPU 矩阵、最终 HTTP 与同卡 SGLang benchmark 进行中；当前结论仍明确保留跨 Torch/cuDNN 的 VAE e2e 差异。
