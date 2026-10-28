@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import time
@@ -35,6 +36,10 @@ def main():
     )
     parser.add_argument("--reference-video", type=Path)
     parser.add_argument("--use-reference-clean-latents", action="store_true")
+    parser.add_argument("--capture-trajectory", action="store_true")
+    parser.add_argument("--match-reference-numerics", action="store_true")
+    parser.add_argument("--disable-und-cache", action="store_true")
+    parser.add_argument("--min-free-gpu-gib", type=float, default=0)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     reference_manifest = json.loads((args.reference / "manifest.json").read_text())
@@ -60,6 +65,17 @@ def main():
     )
 
     torch.cuda.set_device(0)
+    if torch.cuda.mem_get_info()[0] < args.min_free_gpu_gib * 1024**3:
+        raise RuntimeError("Allocated GPU was occupied during diagnostic imports")
+    if args.match_reference_numerics:
+        settings = reference_manifest["numerics"]
+        torch.backends.cudnn.benchmark = settings["cudnn_benchmark"]
+        torch.backends.cudnn.deterministic = settings["cudnn_deterministic"]
+        torch.backends.cudnn.allow_tf32 = settings["cudnn_allow_tf32"]
+        torch.backends.cuda.matmul.allow_tf32 = settings["matmul_allow_tf32"]
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = settings[
+            "allow_bf16_reduced_precision_reduction"
+        ]
     observed = {}
     metrics = {}
     cache = {}
@@ -96,9 +112,13 @@ def main():
         }
 
     started = time.perf_counter()
-    runtime = runtime_module.PwmWamRuntime(
-        args.checkpoint, vae_path=str(args.vae), tokenizer_path=str(args.tokenizer)
+    runtime_options = {"vae_path": str(args.vae), "tokenizer_path": str(args.tokenizer)}
+    cache_parameter = (
+        "enable_und_cache" in inspect.signature(runtime_module.PwmWamRuntime).parameters
     )
+    if args.disable_und_cache and cache_parameter:
+        runtime_options["enable_und_cache"] = False
+    runtime = runtime_module.PwmWamRuntime(args.checkpoint, **runtime_options)
     request = prepare_request(load_request(args.request), runtime.spec)
     capture("pixels", request.pixels)
     compare(
@@ -112,6 +132,34 @@ def main():
     compare("token_ids", reference("text_embedding", "text_embedding.inputs.0"))
 
     original_initial = runtime_module.initial_joint_state
+    trajectory_steps = 0
+    if args.capture_trajectory:
+        original_scheduler = runtime._new_scheduler
+
+        def capture_scheduler(*inputs, **kwargs):
+            scheduler = original_scheduler(*inputs, **kwargs)
+            original_step = scheduler.step
+
+            def capture_step(*inputs, **kwargs):
+                nonlocal trajectory_steps
+                prefix = f"trajectory_step_{trajectory_steps:03d}"
+                for name in ("sample", "model_output", "timestep"):
+                    capture(prefix + "." + name, kwargs[name])
+                if trajectory_steps == 0:
+                    # This is the post-CFG joint velocity, including when the
+                    # first conditional decode differs from the guided result.
+                    capture("first_velocity", kwargs["model_output"])
+                result = original_step(*inputs, **kwargs)
+                capture(prefix + ".result", result[0])
+                for name in ("sample", "model_output", "timestep", "result"):
+                    compare(prefix + "." + name, reference(prefix, prefix + "." + name))
+                trajectory_steps += 1
+                return result
+
+            scheduler.step = capture_step
+            return scheduler
+
+        runtime._new_scheduler = capture_scheduler
 
     def capture_initial(*inputs, **kwargs):
         result = original_initial(*inputs, **kwargs)
@@ -210,8 +258,9 @@ def main():
         video, actions = runtime.sample(request, clean)
         capture("final_video_latents", video)
         capture("final_actions", actions)
+        result = runtime._finalize(request, video, actions)
+        capture("final_physical_actions", torch.from_numpy(result["actions"]))
         if args.reference_video is not None:
-            result = runtime._finalize(request, video, actions)
             capture("decoded_video", torch.from_numpy(result["video_frames"]))
     flags_after = sdpa_flags()
     if flags_before != flags_after:
@@ -224,6 +273,12 @@ def main():
     compare("first_velocity", reference("first_velocity", "first_velocity.0"))
     compare("final_video_latents", reference("samples", "samples.vision.0")[0])
     compare("final_actions", reference("samples", "samples.action.0"))
+    compare("final_physical_actions", reference("actions", "actions.physical"))
+    if (
+        args.capture_trajectory
+        and trajectory_steps != reference_manifest["trajectory_steps"]
+    ):
+        raise AssertionError("Native/reference scheduler step counts differ")
     if args.reference_video is not None:
         compare(
             "decoded_video",
@@ -249,6 +304,10 @@ def main():
         "request_sha256": request_digest,
         "enable_reference_sdpa": args.enable_reference_sdpa,
         "use_reference_clean_latents": args.use_reference_clean_latents,
+        "match_reference_numerics": args.match_reference_numerics,
+        "disable_und_cache": args.disable_und_cache,
+        "cache_parameter_available": cache_parameter,
+        "trajectory_steps": trajectory_steps,
         "sdpa_flags_before": flags_before,
         "sdpa_flags_after": flags_after,
         "metrics": metrics,

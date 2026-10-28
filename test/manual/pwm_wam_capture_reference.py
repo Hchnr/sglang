@@ -25,6 +25,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,11 +34,15 @@ from pathlib import Path
 
 
 def main():
+    launch_cwd = str(Path.cwd())
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-repo", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--capture-trajectory", action="store_true")
+    parser.add_argument("--decode-video", action="store_true")
+    parser.add_argument("--min-free-gpu-gib", type=float, default=0)
     parser.add_argument(
         "--attention-backend", choices=("sdpa", "flash3"), default="sdpa"
     )
@@ -54,6 +59,7 @@ def main():
     os.environ["COSMOS_TRAINING"] = "0"
 
     import diffusers
+    import numpy as np
     import torch
     import transformers
     from cosmos_framework.data.generator.sequence_packing.runtime import from_all_seq
@@ -123,6 +129,12 @@ def main():
         "ld_library_path": os.environ.get("LD_LIBRARY_PATH"),
         "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
         "pid": os.getpid(),
+        "command": shlex.join([sys.executable, *sys.argv]),
+        "cwd": launch_cwd,
+        "python": sys.version,
+        "pythonpath": os.environ.get("PYTHONPATH"),
+        "pythondontwritebytecode": os.environ.get("PYTHONDONTWRITEBYTECODE"),
+        "diagnostic_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "status": "started",
     }
     manifest_path = output / "manifest.json"
@@ -140,6 +152,8 @@ def main():
     torch.distributed.init_process_group("nccl", store=store, rank=0, world_size=1)
     started = time.perf_counter()
     try:
+        if torch.cuda.mem_get_info()[0] < args.min_free_gpu_gib * 1024**3:
+            raise RuntimeError("Allocated GPU was occupied during diagnostic imports")
         with tempfile.TemporaryDirectory(prefix="pwm-reference-") as scratch:
             setup = OmniSetupOverrides(
                 checkpoint_path=str(checkpoint),
@@ -169,9 +183,34 @@ def main():
                 "cudnn_deterministic": torch.backends.cudnn.deterministic,
                 "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
                 "cudnn_sdpa": torch.backends.cuda.cudnn_sdp_enabled(),
+                "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+                "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
             }
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
             spec = OmegaConf.to_container(model.config.action128_spec, resolve=True)
+            trajectory_steps = 0
+            if args.capture_trajectory:
+                from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import (
+                    FlowUniPCMultistepScheduler,
+                )
+
+                original_step = FlowUniPCMultistepScheduler.step
+
+                def capture_step(scheduler, *inputs, **kwargs):
+                    nonlocal trajectory_steps
+                    before = {
+                        name: kwargs[name].detach().cpu().contiguous().clone()
+                        for name in ("sample", "model_output", "timestep")
+                    }
+                    result = original_step(scheduler, *inputs, **kwargs)
+                    save_tree(
+                        f"trajectory_step_{trajectory_steps:03d}",
+                        {**before, "result": result[0]},
+                    )
+                    trajectory_steps += 1
+                    return result
+
+                FlowUniPCMultistepScheduler.step = capture_step
             model.net.action_normalization.validate_contract()
             model.net.action_normalization._reset_transforms()
             seen = set()
@@ -322,10 +361,22 @@ def main():
                         "physical": physical.masked_fill(~mask, 0),
                     },
                 )
+                if args.decode_video:
+                    decoded = model.decode(samples["vision"][0])
+                    frames = (
+                        (((decoded + 1) / 2).clamp(0, 1) * 255)
+                        .to(torch.uint8)[0]
+                        .permute(1, 2, 3, 0)
+                        .cpu()
+                        .numpy()
+                    )
+                    np.save(output / "video.npy", frames, allow_pickle=False)
             manifest.update(
                 status="complete",
                 elapsed_seconds=time.perf_counter() - started,
                 layer_calls=layer_count,
+                trajectory_steps=trajectory_steps,
+                decoded_video=args.decode_video,
             )
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
             print(
