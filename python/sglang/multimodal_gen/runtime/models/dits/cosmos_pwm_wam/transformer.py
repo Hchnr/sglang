@@ -310,10 +310,50 @@ class PwmWamTransformer(nn.Module):
             "video_temporal_causal": False,
             "joint_attn_implementation": "two_way",
             "max_action_dim": 128,
+            "action_tower_projection_mode": "routed",
+            "num_embodiment_domains": 64,
         }
         for name, expected_value in required.items():
             if config.get(name) != expected_value:
                 raise ValueError(f"PWM requires {name}={expected_value!r}")
+        # These change inference semantics without changing tensor shapes. A
+        # valid shard index alone cannot establish compatibility with this core.
+        for section, fields in (
+            (
+                "vlm_config",
+                {
+                    "use_system_prompt": False,
+                    "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+                },
+            ),
+            (
+                "rectified_flow_inference_config",
+                {
+                    "num_train_timesteps": 1000,
+                    "scheduler_type": "unipc",
+                    "shift": 1,
+                    "use_dynamic_shifting": False,
+                },
+            ),
+        ):
+            settings = config.get(section)
+            if not isinstance(settings, dict):
+                raise ValueError(f"PWM requires explicit {section}")  # noqa: TRY004 -- Keep the checkpoint validation error contract.
+            for name, expected_value in fields.items():
+                if settings.get(name) != expected_value:
+                    raise ValueError(
+                        f"PWM requires {section}.{name}={expected_value!r}"
+                    )
+        model_instance = config["vlm_config"].get("model_instance", {})
+        vlm_settings = model_instance.get("config", {})
+        for name, expected_value in {
+            "qk_norm_for_text": True,
+            "include_visual": False,
+        }.items():
+            if vlm_settings.get(name) != expected_value:
+                raise ValueError(
+                    f"PWM requires vlm_config.model_instance.config.{name}={expected_value!r}"
+                )
         expert = config.get("diffusion_expert_config", {})
         for name, expected_value in {
             "vision_spatial_position_mode": "action128_seam",
@@ -389,9 +429,11 @@ class PwmWamTransformer(nn.Module):
                     setattr(
                         module,
                         leaf,
-                        nn.Parameter(value, requires_grad=False)
-                        if name in parameters
-                        else value,
+                        (
+                            nn.Parameter(value, requires_grad=False)
+                            if name in parameters
+                            else value
+                        ),
                     )
                     loaded_bytes += value.numel() * value.element_size()
         model.load_info = {

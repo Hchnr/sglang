@@ -88,7 +88,7 @@ GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5
 
 - 修复/文档提交 `a2dd639bda`。新增四个独立 manual 诊断工具，Ruff/check/format 全通过：source 捕获、native 中间量比较、纯 layer 回放、纯 VAE 回放。它们明确区分实际像素端到端与诊断用 reference-clean 注入，不进入生产依赖。
 - VAE 首差异确认为同值、同 shape/stride、同 contiguous NCDHW input/weight 的早期 BF16 conv1；首卷积、norm、SiLU 均精确一致。该单卷积 283 个元素不同，max abs 0.0078125。benchmark/deterministic/TF32/layout 控制没有消除差异，不据此改全局设置或放宽验收阈值。
-- source clean latent 注入后：首 velocity、layer 0/35 的三塔输入/输出、最终物理/normalized actions 均逐元素一致；最终 video latent max abs 1.192e-7、relative L2 1.49e-8。相同 latent 的 decode uint8 MAE 0.07887、max abs 3，仍显示 VAE 环境差异。**这是隔离验证，不是原始像素 e2e strict parity 通过。**
+- 3-step smoke 注入 source clean latent 后：首 velocity、layer 0/35 的三塔输入/输出、最终物理/normalized actions 均逐元素一致；最终 video latent max abs 1.192e-7、relative L2 1.49e-8。该完整采样结果的 decode uint8 MAE 0.07887、max abs 3；这里最终 video latent 仍有上述 FP32 末位差异，不是严格相同 decode 输入。**这是隔离验证，不是原始像素 e2e strict parity 通过，也不推广为整个请求矩阵的隔离验证结果。**
 - source/target VAE-only 证据分别为 `vae_layout_torch210` / `vae_layout_torch214`，cuDNN 91501 / 92400。目标 Torch 编译要求 cuDNN 9.24，不强行注入旧 9.15 库。详细命令与限制见 `artifacts/pwm_wam_1028/numerical_diagnosis.md`。
 - 七个权重分片 SHA-256 审计完成：总计 32,364,372,752 bytes，文件 `artifacts/pwm_wam_1028/weight_sha256.json`；实际依赖位置/版本在 `environment.json`。独立环境 python-dateutil 已从 3.0 调整为仓库要求的 2.9.0.post0。
 - 最终审查补启动资产/配置 guards，避免错误 VAE/tokenizer、改变的推理配置或越界 projection ID 静默进入 GPU；资产配置 hash 不等同于完整权重绑定。
@@ -102,3 +102,7 @@ GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5
 - 下载生命周期修复单独提交：锁内打开句柄，DELETE/过期清理不会使已开始的下载失效；ASGI 正常完成、发送异常及 body 尚未启动时取消都关闭句柄。9 项 serving CPU 测试通过，最终 native HTTP 重测通过。兼容接口最终复测仍在进行。
 - 独立验证环境 `.venv` 的核心包安装在本仓库；`pwm_validation_base.pth` 只读追加相邻环境的第三方 site-packages（包括 msgspec/FastAPI/uvicorn），不包含 Cosmos/vLLM 仓库代码。`environment.json` 记录主要包实际位置，补充 `environment_all_packages.json` 记录完整首选 distribution 版本/路径。这不是干净容器全量安装的验证，保留这一环境边界。
 - 共享 NFS 使最后几个进程的 Python import/spawn 明显变慢；此时间与 GPU 请求延迟分开记录，不作为模型性能结论。
+
+### 决策 D07：保持测试依赖与现有 CI 分组一致
+
+31 项测试的张量计算在 CPU 上执行，但模型测试需要 Diffusers。既有 hosted CPU workflow 只安装 `python[dev]`，不包含该可选依赖；因此将三份测试注册到已有安装 diffusion 依赖的 `base-b-test-diffusion-unit-1-gpu-h100`，沿用其 `register_cuda_ci` 入口，不给所有 CPU CI 增加大型依赖，也不以 skip 隐藏测试。实际测试仍在 CPU 上运行，私有实权重 GPU 矩阵保留 manual harness。

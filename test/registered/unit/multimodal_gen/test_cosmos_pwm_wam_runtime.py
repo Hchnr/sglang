@@ -7,11 +7,20 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
+from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_pwm_wam.assets import (
+    validate_action_registry,
+    validate_tokenizer,
+    validate_vae_config,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_pwm_wam.request import (
     load_request,
     prepare_request,
@@ -23,12 +32,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     guided_velocity,
     initial_joint_state,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# CPU tensor tests need the diffusion lane's optional dependencies.
+register_cuda_ci(est_time=5, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 class _VelocityModel(nn.Module):
@@ -69,6 +77,7 @@ class _TinyRuntime(PwmWamRuntime):
         self.contract_fingerprint = "test"
         self.checkpoint_path = "/fixed/artifact"
         self.checkpoint_config_sha256 = "test-config-hash"
+        self.asset_file_sha256 = {"vae/config.json": "vae-config-hash"}
 
     def text_ids(self, caption):
         return torch.tensor([1 if caption else -1])
@@ -108,6 +117,101 @@ class TestPwmRuntimeContracts(CustomTestCase):
                 }
             },
         }
+
+    def test_asset_geometry_and_projection_ids_fail_before_gpu_use(self):
+        """A valid but wrong Wan VAE or out-of-range domain must not poison a worker."""
+        config = {
+            "z_dim": 48,
+            "patch_size": 2,
+            "scale_factor_spatial": 16,
+            "scale_factor_temporal": 4,
+            "in_channels": 12,
+            "out_channels": 12,
+            "base_dim": 160,
+            "decoder_base_dim": 256,
+            "dim_mult": [1, 2, 4, 4],
+            "num_res_blocks": 2,
+            "temperal_downsample": [False, True, True],
+            "is_residual": True,
+            "clip_output": False,
+            "attn_scales": [],
+            "dropout": 0.0,
+            "latents_mean": [0.0] * 48,
+            "latents_std": [1.0] * 48,
+        }
+        validate_vae_config(config)
+        for field, invalid in (
+            ("z_dim", 16),
+            ("patch_size", 1),
+            ("scale_factor_spatial", 8),
+            ("scale_factor_temporal", 8),
+            ("latents_std", [0.0] * 48),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                validate_vae_config({**config, field: invalid})
+        spec = {**self.spec, "transforms": [{}, {}]}
+        validate_action_registry(spec)
+        for values in ([64, 0], [-1, 0], [True, 0], [0]):
+            bad = copy.deepcopy(spec)
+            bad["registry"]["domain_projection_ids"] = values
+            with self.assertRaisesRegex(ValueError, "domain_projection_ids"):
+                validate_action_registry(bad)
+
+    def test_tokenizer_rejects_same_size_changed_template_and_special_ids(self):
+        """Vocabulary size alone cannot bind special tokens or WAM's chat renderer."""
+
+        class Tokenizer:
+            vocab_size = 151643
+            bos_token_id = None
+            eos_token_id = 151645
+            pad_token_id = 151643
+            special: ClassVar[dict[str, int]] = {
+                "<|endoftext|>": 151643,
+                "<|im_start|>": 151644,
+                "<|im_end|>": 151645,
+                "<|vision_start|>": 151652,
+                "<|vision_end|>": 151653,
+                "<|image_pad|>": 151655,
+                "<|video_pad|>": 151656,
+            }
+
+            def __len__(self):
+                return 151669
+
+            def convert_tokens_to_ids(self, token):
+                return self.special[token]
+
+            def apply_chat_template(self, messages, *, tokenize, **kwargs):
+                prompt = messages[0]["content"]
+                if not tokenize:
+                    return (
+                        f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    )
+                body = [54, 1402, 45958, 21730, 25, 3271, 10525, 13] if prompt else []
+                return [151644, 872, 198, *body, 151645, 198, 151644, 77091, 198]
+
+        tokenizer = Tokenizer()
+        validate_tokenizer(tokenizer)
+        with (
+            patch.object(tokenizer, "vocab_size", 32000),
+            self.assertRaisesRegex(ValueError, "vocabulary"),
+        ):
+            validate_tokenizer(tokenizer)
+        with (
+            patch.object(tokenizer, "eos_token_id", 2),
+            self.assertRaisesRegex(ValueError, "BOS/EOS/PAD"),
+        ):
+            validate_tokenizer(tokenizer)
+        with (
+            patch.object(tokenizer, "convert_tokens_to_ids", return_value=0),
+            self.assertRaisesRegex(ValueError, "special token"),
+        ):
+            validate_tokenizer(tokenizer)
+        with (
+            patch.object(tokenizer, "apply_chat_template", return_value=[]),
+            self.assertRaisesRegex(ValueError, "probe mismatch"),
+        ):
+            validate_tokenizer(tokenizer)
 
     def test_independent_action_rate_owns_horizon_and_video_rounding(self):
         """The action rate, not the display rate, determines duration and T=4k+1."""
@@ -253,11 +357,11 @@ class TestPwmRuntimeContracts(CustomTestCase):
             selected_roles=["main", "wrist"],
             camera_layout=[["main", "top", 48, 16], ["wrist", "bottom", 32, 16]],
         )
-        with patch(
-            "requests.get", side_effect=AssertionError("fetched invalid layout")
+        with (
+            patch("requests.get", side_effect=AssertionError("fetched invalid layout")),
+            self.assertRaisesRegex(ValueError, "Bottom cameras"),
         ):
-            with self.assertRaisesRegex(ValueError, "Bottom cameras"):
-                validate_request(raw, self.spec)
+            validate_request(raw, self.spec)
         bad = self.directory / "invalid.png"
         bad.write_bytes(b"not a media file")
         with self.assertRaisesRegex(ValueError, "Cannot decode"):
@@ -395,11 +499,11 @@ class TestPwmRuntimeContracts(CustomTestCase):
         with sdpa_kernel([SDPBackend.MATH]):
             previous = flags()
             with patch.object(runtime, "encode_observation", side_effect=encode):
-                with patch.object(
-                    runtime, "sample", side_effect=RuntimeError("failed")
+                with (
+                    patch.object(runtime, "sample", side_effect=RuntimeError("failed")),
+                    self.assertRaisesRegex(RuntimeError, "failed"),
                 ):
-                    with self.assertRaisesRegex(RuntimeError, "failed"):
-                        runtime.forward(self.raw)
+                    runtime.forward(self.raw)
                 self.assertEqual(flags(), previous)
                 with patch.object(runtime, "_finalize", return_value={}):
                     result = runtime.forward(self.raw)

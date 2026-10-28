@@ -16,6 +16,8 @@ import numpy as np
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
+from starlette.requests import ClientDisconnect
+
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_pwm_wam import (
     CosmosPWMWAMPipelineConfig,
     is_cosmos_pwm_wam_package,
@@ -31,11 +33,11 @@ from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
     pwm_wam_video_response,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from starlette.requests import ClientDisconnect
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+# CPU tensor tests need the diffusion lane's optional dependencies.
+register_cuda_ci(est_time=15, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 class TestCosmosPWMWAMServing(CustomTestCase):

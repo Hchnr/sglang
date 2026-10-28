@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Derived WAM attention/masking invariants and strict artifact bookkeeping."""
 
+import copy
 import json
 import tempfile
 import unittest
@@ -9,6 +10,8 @@ from pathlib import Path
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 from safetensors.torch import save_file
+from torch import nn
+
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.positions import (
     position_ids,
 )
@@ -24,11 +27,11 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.transformer import
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.vae import (
     preserve_checkpoint_rms,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from torch import nn
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+# CPU tensor tests need the diffusion lane's optional dependencies.
+register_cuda_ci(est_time=8, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 class TestPwmModelContracts(CustomTestCase):
@@ -188,6 +191,21 @@ class TestPwmArtifactValidation(CustomTestCase):
             "video_temporal_causal": False,
             "joint_attn_implementation": "two_way",
             "max_action_dim": 128,
+            "action_tower_projection_mode": "routed",
+            "num_embodiment_domains": 64,
+            "vlm_config": {
+                "use_system_prompt": False,
+                "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+                "model_instance": {
+                    "config": {"qk_norm_for_text": True, "include_visual": False},
+                },
+            },
+            "rectified_flow_inference_config": {
+                "num_train_timesteps": 1000,
+                "scheduler_type": "unipc",
+                "shift": 1,
+                "use_dynamic_shifting": False,
+            },
             "action128_spec": {"registry": {"domains": ["test"]}},
             "diffusion_expert_config": {
                 "vision_spatial_position_mode": "action128_seam",
@@ -223,6 +241,32 @@ class TestPwmArtifactValidation(CustomTestCase):
                 rtol=0,
             )
             self.assertEqual(model.contract_digest.dtype, torch.uint8)
+            for section, name, value in (
+                ("vlm_config", "use_system_prompt", True),
+                ("vlm_config", "model_name", "Qwen/another-model"),
+                ("rectified_flow_inference_config", "scheduler_type", "edm"),
+                ("rectified_flow_inference_config", "num_train_timesteps", 500),
+                ("rectified_flow_inference_config", "use_dynamic_shifting", True),
+            ):
+                incompatible = copy.deepcopy(config)
+                incompatible[section][name] = value
+                (root / "config.json").write_text(
+                    json.dumps({"model": {"config": incompatible}})
+                )
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(ValueError, f"{section}.{name}"),
+                ):
+                    TinyArtifactTransformer.from_pretrained(root, device="cpu")
+            for name, value in (("qk_norm_for_text", False), ("include_visual", True)):
+                incompatible = copy.deepcopy(config)
+                incompatible["vlm_config"]["model_instance"]["config"][name] = value
+                (root / "config.json").write_text(
+                    json.dumps({"model": {"config": incompatible}})
+                )
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, name):
+                    TinyArtifactTransformer.from_pretrained(root, device="cpu")
+            (root / "config.json").write_text(json.dumps({"model": {"config": config}}))
             for variant, error in (
                 (
                     {

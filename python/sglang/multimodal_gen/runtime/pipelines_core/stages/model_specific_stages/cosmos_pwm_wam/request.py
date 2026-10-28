@@ -144,7 +144,7 @@ def load_request(path: str | Path) -> dict:
     path = Path(path).expanduser().resolve()
     raw = json.loads(path.read_text())
     if not isinstance(raw, dict):
-        raise ValueError("WAM request JSON must contain one object")
+        raise ValueError("WAM request JSON must contain one object")  # noqa: TRY004 -- Request validation uses ValueError for HTTP 400.
     for name in ("vision_path", "prompt_path"):
         value = raw.get(name)
         if value is not None and not urlparse(str(value)).scheme:
@@ -161,7 +161,7 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
     the same request. Observation decoding happens once in prepare_request.
     """
     if not isinstance(raw, dict):
-        raise ValueError("WAM request must be an object")
+        raise ValueError("WAM request must be an object")  # noqa: TRY004 -- Request validation uses ValueError for HTTP 400.
     fixed_defaults = {
         "duration_template": "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS.",
         "resolution_template": "This video is of {height}x{width} resolution.",
@@ -270,7 +270,7 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
     raw = copy.deepcopy(raw)
     extra = raw.get("extra") or {}
     if not isinstance(extra, dict) or not isinstance(extra.get("action128", {}), dict):
-        raise ValueError("extra.action128 must be an object")
+        raise ValueError("extra.action128 must be an object")  # noqa: TRY004 -- Request validation uses ValueError for HTTP 400.
     ext = copy.deepcopy(extra.get("action128", {}))
     allowed = {
         "action_domain",
@@ -365,12 +365,12 @@ def validate_request(raw: dict, spec: dict, *, base_dir: Path | None = None) -> 
         "" if raw.get("negative_prompt") is None else raw["negative_prompt"]
     )
     if not isinstance(negative_prompt, str):
-        raise ValueError("negative_prompt must be text")
+        raise ValueError("negative_prompt must be text")  # noqa: TRY004 -- Request validation uses ValueError for HTTP 400.
     normalize_cfg = raw.get("normalize_cfg")
     normalize_cfg = False if normalize_cfg is None else normalize_cfg
     return_video = ext.get("return_video", True)
     if not isinstance(normalize_cfg, bool) or not isinstance(return_video, bool):
-        raise ValueError("normalize_cfg and return_video must be booleans")
+        raise ValueError("normalize_cfg and return_video must be booleans")  # noqa: TRY004 -- Request validation uses ValueError for HTTP 400.
     vision_path = raw.get("vision_path")
     if not isinstance(vision_path, (str, Path)) or not str(vision_path):
         raise ValueError("vision_path is required for WAM")
@@ -480,16 +480,18 @@ def prepare_request(
     if not isinstance(title, str) or not title.strip():
         raise ValueError("WAM task_title must be nonempty text")
     domain_id = registry["domains"].index(domain)
-    formatted = dict(
-        task_title=title,
-        command=prompt,
-        embodiment=registry["embodiments"][registry["domain_embodiments"][domain_id]],
-        duration=f"{duration:g}s",
-        fps=fps,
-        action_frequency_hz=action_fps,
-        resolution={"W": width, "H": height},
-        aspect_ratio=f"{width // math.gcd(width, height)}:{height // math.gcd(width, height)}",
-    )
+    formatted = {
+        "task_title": title,
+        "command": prompt,
+        "embodiment": registry["embodiments"][
+            registry["domain_embodiments"][domain_id]
+        ],
+        "duration": f"{duration:g}s",
+        "fps": fps,
+        "action_frequency_hz": action_fps,
+        "resolution": {"W": width, "H": height},
+        "aspect_ratio": f"{width // math.gcd(width, height)}:{height // math.gcd(width, height)}",
+    }
     if layout is not None:
         formatted["camera_layout"] = layout
     draw = (

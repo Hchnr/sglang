@@ -26,6 +26,12 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.positions import (
     rotary,
 )
 
+from .assets import (
+    snapshot_asset_files,
+    validate_action_registry,
+    validate_tokenizer,
+    validate_vae_config,
+)
 from .request import PwmRequest, prepare_request
 
 
@@ -105,14 +111,15 @@ class PwmWamRuntime(nn.Module):
         self.device = torch.device(device)
         config = json.loads(config_bytes)["model"]["config"]
         self.spec = config["action128_spec"]
+        validate_action_registry(self.spec)
         self.transformer = PwmWamTransformer.from_pretrained(
             checkpoint, device=self.device, dtype=torch.bfloat16, load_mode="serial"
         )
-        contract = dict(
-            action128_spec=self.spec,
-            vision_spatial_position_mode="action128_seam",
-            spatial_coordinate_version="pixel_seam_patch_corner_v1",
-        )
+        contract = {
+            "action128_spec": self.spec,
+            "vision_spatial_position_mode": "action128_seam",
+            "spatial_coordinate_version": "pixel_seam_patch_corner_v1",
+        }
         digest = hashlib.blake2b(
             json.dumps(contract, sort_keys=True).encode(), digest_size=16
         ).digest()
@@ -157,11 +164,14 @@ class PwmWamRuntime(nn.Module):
             )
         ):
             raise ValueError(f"Incomplete PWM VAE checkpoint: {loading_info}")
+        validate_vae_config(vae.config)
         self.vae = vae.to(self.device).eval()
         preserve_checkpoint_rms(self.vae)
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, local_files_only=True
         )
+        validate_tokenizer(self.tokenizer)
+        self.asset_file_sha256 = snapshot_asset_files(vae_path, tokenizer_path)
         self.eval()
 
     def text_ids(self, caption: str) -> Tensor:
@@ -338,34 +348,35 @@ class PwmWamRuntime(nn.Module):
                 .cpu()
                 .numpy()
             )
-        return dict(
-            actions=physical.cpu().numpy(),
-            normalized_actions=normalized.cpu().numpy(),
-            action_domain=request.domain,
-            action_dim_mask=request.mask,
-            action_fps=request.action_fps,
-            action_timestamps_seconds=(
+        return {
+            "actions": physical.cpu().numpy(),
+            "normalized_actions": normalized.cpu().numpy(),
+            "action_domain": request.domain,
+            "action_dim_mask": request.mask,
+            "action_fps": request.action_fps,
+            "action_timestamps_seconds": (
                 torch.arange(request.action_length, dtype=torch.float64)
                 / request.action_fps
             ).tolist(),
-            action_units="raw_physical_or_source_units",
-            seed=request.seed,
-            conditioning_caption_sha256=hashlib.sha256(
+            "action_units": "raw_physical_or_source_units",
+            "seed": request.seed,
+            "conditioning_caption_sha256": hashlib.sha256(
                 request.caption.encode()
             ).hexdigest(),
-            contract_fingerprint=self.contract_fingerprint,
-            checkpoint_path=self.checkpoint_path,
-            checkpoint_config_sha256=self.checkpoint_config_sha256,
-            loader_info=dict(self.transformer.load_info),
-            video_frames=frames,
-            video_fps=request.video_fps,
-            parameters={
+            "contract_fingerprint": self.contract_fingerprint,
+            "checkpoint_path": self.checkpoint_path,
+            "checkpoint_config_sha256": self.checkpoint_config_sha256,
+            "loader_info": dict(self.transformer.load_info),
+            "asset_file_sha256": dict(self.asset_file_sha256),
+            "video_frames": frames,
+            "video_fps": request.video_fps,
+            "parameters": {
                 "num_inference_steps": request.steps,
                 "num_frames": request.video_frames,
                 "guidance": request.guidance,
                 "shift": request.shift,
             },
-        )
+        }
 
     @torch.inference_mode()
     def forward(self, raw: dict) -> dict[str, Any]:

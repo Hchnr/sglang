@@ -31,6 +31,9 @@ pip install -e 'python[diffusion]'
 加载器严格核对索引、权重名称、shape、dtype 和 Action128 合同摘要。模型路径指向
 启动时选定的 artifact，不解析训练目录的 `latest`，也不热切换权重。所有三个目录
 必须与同一次导出的模型兼容；任意 Wan VAE 或任意 Qwen tokenizer 不能替换它们。
+启动时还检查固定 Qwen3-VL-8B 文本塔配置、UniPC 配置、VAE 结构，以及 tokenizer
+词表大小、特殊 token ID 和条件/无条件单轮 chat template 的固定探针。上述检查能
+拒绝已知不兼容结构，不能证明任意外部资产的权重与训练 checkpoint 一致。
 
 ## 启动原生 action 服务
 
@@ -177,7 +180,9 @@ if __name__ == "__main__":
 `checkpoint_path` 是启动时固定 artifact 的绝对路径；
 `checkpoint_config_sha256` 只标识 config 文件，**不是权重 hash**。
 `contract_fingerprint` 标识 Action128 合同，`loader_info` 记录加载的张量数、分片数
-和字节数。审计具体权重版本时应另外保留导出 manifest 和权重校验和。
+和字节数。`asset_file_sha256` 记录 VAE 配置与 tokenizer 配置、词表、chat template
+文件的摘要，**不包含 VAE 或模型权重**。审计具体权重版本时应另外保留导出 manifest
+和权重校验和。
 
 `timing_seconds` 分为 `prepare`、`vae_encode`、`sample`、`finalize` 和 `total`。
 GPU 阶段边界执行同步，因此包含同步成本；不包含排队、HTTP 传输或 MP4 编码时间。
@@ -209,8 +214,9 @@ video = result["data"][0].get("video")
 
 视频以 `data[0].video.url` 附件返回，可从
 `GET /v1/actions/videos/{id}/content` 下载，通过
-`DELETE /v1/actions/videos/{id}` 删除。附件最多保留 128 个或 1 小时，服务重启后
-失效；应及时保存需要长期保留的结果。
+`DELETE /v1/actions/videos/{id}` 删除。附件上限为 128 个，下载链接 1 小时后失效；
+过期文件在后续附件操作或服务关闭时清理，服务重启后链接失效。应及时保存需要长期
+保留的结果。
 
 已有 Cosmos `/generate` 客户端可启动独立兼容 facade：
 
@@ -238,7 +244,9 @@ graph、prefix cache、realtime/OpenPI WebSocket。错误请求不会变更下�
 mask、条件或 solver 历史。媒体需要下载/解码，因此真实媒体与声明布局的匹配检查
 在 worker 中完成；纯参数和声明布局在入队前校验。
 
-CPU 合同测试：
+CPU 合同测试需要安装 diffusion 依赖。CI 将其注册到已有的 diffusion unit suite
+（`base-b-test-diffusion-unit-1-gpu-h100`），因为普通 hosted CPU suite 不安装
+Diffusers；测试本身仍使用 CPU 张量，缺少依赖时不会跳过：
 
 ```bash
 python test/registered/unit/multimodal_gen/test_cosmos_pwm_wam_model.py
