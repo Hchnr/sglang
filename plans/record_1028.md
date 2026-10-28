@@ -39,4 +39,17 @@
 
 ## 进行中的工作
 
+## 2026-10-28 17:14：请求与采样接入
+
+- 核心提交：`92e50e09b2`。本阶段新增共用 WAM 校验、第一帧图片/视频/URL 输入、相机 canvas resize/seam、caption、独立视频/动作频率与随机 seed 冻结。
+- 原生 runtime 使用 request-owned 联合 FP32 latent、每请求新 UniPC，始终联合 VIDEO/ACTION；`return_video=false` 仅关闭解码交付。分别返回物理/normalized actions、domain、mask、时间戳和合同指纹。
+- 测试覆盖非连续 mask、独立噪声、联合 CFG norm、A/B/A 状态隔离、normalize/projection domain 区别、媒体/URL 和 prompt 文件。阶段耗时使用 CUDA 同步边界，后续报告包含这一测量成本。
+- 当前源 `guidance_interval` 比较的是 solver 的 0..1000 时间（非网络 rescale 后时间）；UniPC 忽略 EDM `sigma_max`，首版仅接受缺省/80，其他值明确拒绝。
+- 目标环境 Torch 2.14.1 / Transformers 5.19.0 / Diffusers 0.37.0 导入成功。公共测试导入发现缺 `datasets`，pipeline 导入缺 `addict`；统一补包，无 monkeypatch 绕过导入。此前不完整 Torch 导入失败已消除。
+- 中间量 reference 捕获首次在 CUBLAS 初始化失败，保存输入后独立排查；同 checkpoint 的原始 smoke reference 已成功，两者分开记账。
+
+### 决策 D04：保留原生入口与薄兼容服务
+
+提供 SGLang `generate_action` 和 `/v1/actions/generate`，另以独立 `pwm_compat` 进程保留 Cosmos `/generate`、`/models`、`/info`、`/domains`、`/healthz`、`/outputs` 形状；全部通过同一原生 SGLang worker，不调用 Cosmos 服务。视频临时附件限定随机 ID、最多 128 个、保留一小时，正常退出清理。兼容层不复制 Cosmos 全部 defaults/output 持久化系统，差异在部署说明中列明。
+
 实现与验证尚未完成。每阶段补充改动、命令/结果、失败原因、修正、提交和剩余风险。
