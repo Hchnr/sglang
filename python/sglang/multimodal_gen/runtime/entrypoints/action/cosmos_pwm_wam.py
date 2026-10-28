@@ -15,11 +15,12 @@ from threading import RLock
 from typing import Any
 
 import numpy as np
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
+
 from sglang.multimodal_gen.configs.sample.cosmos_pwm_wam import (
     CosmosPWMWAMSamplingParams,
 )
-from starlette.concurrency import run_in_threadpool
-from starlette.responses import StreamingResponse
 
 
 def lower_pwm_wam_request(payload: dict[str, Any]) -> dict[str, Any]:

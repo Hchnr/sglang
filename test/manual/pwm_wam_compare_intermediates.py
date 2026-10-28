@@ -49,6 +49,8 @@ def main():
     import torch
     import transformers
     from safetensors.torch import load_file, save_file
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_pwm_wam import (
         runtime as runtime_module,
     )
@@ -56,7 +58,6 @@ def main():
         load_request,
         prepare_request,
     )
-    from torch.nn.attention import SDPBackend, sdpa_kernel
 
     torch.cuda.set_device(0)
     observed = {}

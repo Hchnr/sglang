@@ -143,6 +143,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
 
     import torch
+
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_pwm_wam.request import (
         load_request,
     )

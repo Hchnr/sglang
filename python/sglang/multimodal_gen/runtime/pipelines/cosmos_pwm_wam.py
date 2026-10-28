@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import torch
+
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_pwm_wam import (
     CosmosPWMWAMPipelineConfig,
 )

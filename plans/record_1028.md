@@ -106,3 +106,15 @@ GPU2 当前 Cosmos 基线（Libero 960×640、T=40、5 steps、CFG=1.5、shift=5
 ### 决策 D07：保持测试依赖与现有 CI 分组一致
 
 31 项测试的张量计算在 CPU 上执行，但模型测试需要 Diffusers。既有 hosted CPU workflow 只安装 `python[dev]`，不包含该可选依赖；因此将三份测试注册到已有安装 diffusion 依赖的 `base-b-test-diffusion-unit-1-gpu-h100`，沿用其 `register_cuda_ci` 入口，不给所有 CPU CI 增加大型依赖，也不以 skip 隐藏测试。实际测试仍在 CPU 上运行，私有实权重 GPU 矩阵保留 manual harness。
+
+## 2026-10-28 18:20：实现与验证收尾
+
+- 生命周期提交 `66643efca1`；资产/配置 guards、依赖正确的 CI 注册和风格修正提交 `0224fcb2ba`。收尾检查将其余五份新文件的 import 分组对齐仓库 isort，仅导入分组/空行变化。
+- 31 项 CPU 张量测试再次全部通过（2.289 s 测试体）；后续仅 CI 注册与导入分组调整。已有 CI collect/validate/filter 确认三文件全进入目标 diffusion unit suite，无 skip。22 份新 Python 文件 Ruff、format、isort 全通过；`git diff --check` 干净。结果 `final_style_check.log`。
+- 最终 raw-pixel matrix 七请求六场景对当前 Cosmos：所有 shape/离散合同相等、所有 inactive 维为零；active physical relative L2 0.007525–0.016698，normalized 0.008812–0.023762，video MAE 0.58108–2.23442。完整指标 `final_matrix_comparison.json`；不宣称 strict E2E parity。
+- 数值独立复核收紧证据措辞：跨 Torch 精确三塔回放指 layer 0；完整网络+solver 的精确动作证据限于 3-step smoke 的 reference-clean 注入；该实验 decode 前最终 latent 仍有 1.192e-7 差异。严格同 source latent 的纯 VAE decoder BF16 输出 max abs 0.021484375、relative L2 0.00260766。
+- 最终 Python /native HTTP /facade 的同 smoke 动作和 normalized actions 逐值相同，13 项 metadata/资产摘要相同；两 HTTP 的 MP4 逐字节一致，86,268 bytes。错误恢复、四并发 1×200+3×503/Retry-After、视频开关、下载/删除/404、两服务保留视频后 SIGTERM 清理全部通过。复现命令、脚本、原始响应、数组和日志见 `http_validation/REPRODUCE.md` 与 `http_validation/final/`。
+- 同 GPU2 六次顺序性能对照：当前 Cosmos SDPA warm median 3.429874 s，FA3+compile 2.232923 s；SGLang Python 3.239146 s，direct runtime 3.227952 s。Python 比已有 FA3+compile 慢 45.1%；本次不宣称提速。Python 同请求调用耗时减 worker 耗时的中位数 10.1 ms，两个入口动作精确一致、各自重复精确一致。
+- direct runtime 峰值 allocated 34,770,594,816 bytes、reserved 35,383,148,544 bytes；计时 960×640、40 actions、41 video frames、5 steps、guidance=1.5、shift=5、seed=42、不解码视频。完整数据见 `benchmark/summary.json`。带视频矩阵/HTTP 的耗时分开列于报告，没有把 Python 父进程零显存误报为 worker 显存。
+- 全部本任务 GPU 推理与 HTTP 服务/worker 已退出。共享节点收尾观察到其他外部 GPU 作业；未触碰它们，性能未宣称独占节点或统计显著性。
+- 最终报告补齐支持范围、文件落点、环境 overlay、资产摘要边界、数值未验收项、完整复现入口与本地提交。私有数据/权重/环境未加入 Git；无远端推送、无其他 checkout 改动。

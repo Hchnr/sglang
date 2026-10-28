@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+
 from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
     ActionVideoStore,
     lower_pwm_wam_request,
@@ -179,6 +180,7 @@ def main() -> None:
     args = parser.parse_args()
 
     import uvicorn
+
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
