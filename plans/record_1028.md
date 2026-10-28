@@ -176,3 +176,13 @@ GPU0 初查空闲，导入期间外部任务占约 50 GB，第一次诊断加载
 HTTP adapter已有白名单，但Python generate_action直接创建模型sampling params。ActionSamplingParams中generator_device/save_output/return_file_paths_only/max_sequence_length等字段此前可被接受却不进入WAM推理，raw与外层显式seed/guidance等冲突也可能被setdefault静默忽略。width/height/runtime并非该独立dataclass字段，本来会TypeError，最初审查推断已纠正。README一处runtime.enable_und_cache包装适用于HTTP，Python应使用直接采样字段。
 
 由WAM sampling层基于显式传参来源拒绝不支持字段和双来源冲突，检查factory单独处理的diffusers_kwargs；不改通用action模型行为。不改变数学路径，已完成GPU数值证据继续有效；补定点CPU负例、有效参数正例及一次真实Pythonworker验证。完整目标在修复和复核完成前保持active。
+
+## 2026-10-28 19:30：最终接口修复验证及交付
+
+- Python参数合同补丁独立提交 `f616e8eb13`，只修改WAM sampling、对应serving测试及部署README。未消费的通用字段显式报错；factory单独处理的diffusers_kwargs也被拒绝；raw/直接字段不同值冲突拒绝，同值重复兼容，canonicalization后的重复调整稳定。没有修改通用action模型或三塔数学路径。
+- 最后serving CPU 15/15通过（3.297s），新增3个测试方法覆盖真实factory、未支持字段、双来源冲突、相对路径/prompt文件/extra规范化及重复调整。结合此前model9/runtime17，本轮新增回归合计41项均通过。已有完整Pi05/Cosmos3/registry回归为163 passed +59 subtests passed。
+- 最后一次真实Python worker复测：12类非法请求均在入队前拒绝，记录的queued_requests全部0；随后raw-off与完整direct-kwargs-on两次有效请求成功，physical actions、normalized actions、uint8视频与彼此及旧基线逐元素一致。证据 `und_cache_serving/python_admission/{summary,shutdown}.json`。父进程、worker和resource tracker均已退出。
+- 最后28份Python变更的仓库Ruff hook规则、format、isort、git diff检查全部通过，结果 `final_admission_style.log`。报告本地链接检查通过。未因修复输入校验而重复已经通过且计算路径未变化的GPU数值矩阵。
+- 独立审查完成：生产路径原生执行、请求状态隔离、完整权重保留、视频生命周期和参数错误处理均无剩余阻塞。报告修正了“全权重数值检查”的过强措辞，区分key/shape/dtype校验与原值保留；明确早期comparison文件内source commit字段只是初始revision，不覆盖逐场景来源审计。
+- 本轮单GPU/B1原生接入、同环境数值对齐、跨环境误差定位/视频质量验证，以及有实测收益的请求内UND复用和显存优化已完成。缓存默认仍关闭；保留未缓存路径、source reference、ABBA/profile/过程对齐工具，供后续优化回归。跨Torch/cuDNN的动作差异及尚未超过已测Cosmos FA3+compile性能均如实保留，不宣称机器人闭环质量或未实现的多卡/compile能力。
+- 最终交付入口为 `plans/report_1028.md`、本记录与 `examples/diffusion/cosmos_pwm_wam/README.md`。所有代码分批提交到本地pwm_infer，私有资产和大体积证据留在ignored artifacts；无远端push/PR、无其他checkout修改、无外部进程终止。所有自建服务已停止、临时服务视频清理，完整验证输出保留供review。

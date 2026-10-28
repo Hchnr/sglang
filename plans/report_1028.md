@@ -1,6 +1,6 @@
 # 三塔 PWM WAM 接入 SGLang：结论
 
-更新（19:15）：同环境六场景原像素对照、目标环境缓存矩阵及三入口复测均完成，动作和视频逐位一致。UND 缓存实测延迟下降 3.15%（原尺寸无视频 decode）和 13.14%（带视频短请求）；GPU 模型权重减少 1.159 GiB。最终审查发现 Python 入口部分继承字段未消费、显式字段与 raw 冲突会被静默忽略，正在补严格校验和定点验证，尚未将完整目标标为完成。
+已完成本轮单GPU/B1范围的原生WAM接入、正确性验证和两项保守优化。同环境Cosmos-vs-native六场景的动作及视频逐位一致，目标环境的缓存开关/三入口互比也逐位一致。UND缓存相对未缓存路径实测延迟下降 **3.15%**（原尺寸无视频decode）和 **13.14%**（带视频短请求），GPU模型权重减少 **1.159 GiB**。最终审查发现的Python参数静默忽略问题已修复并经真实worker验证；所有本任务服务和worker均已退出。
 
 原生接入与功能验证已完成：真实 checkpoint 由 SGLang worker 直接执行 UND、VIDEO、ACTION 三塔及联合 UniPC，Python、原生 action HTTP 和 Cosmos `/generate` 兼容入口均可交付动作及可选视频。
 
@@ -26,10 +26,11 @@ Review 可从 [pipeline](../python/sglang/multimodal_gen/runtime/pipelines/cosmo
 | --- | --- |
 | 严格权重加载与合同验证 | 实权重成功；shape/dtype/索引/合同/资产/registry 负例已测试 |
 | 原生三塔和联合 UniPC | 同环境六场景原始像素输入：全宽动作、normalized actions、视频逐位一致；fresh smoke 生成坐标全轨迹一致，固定条件帧末位差异见下文 |
-| 新增 CPU 测试 | 38/38：9 model +17 runtime +12 serving |
+| 新增 CPU 测试 | 41/41：9 model +17 runtime +15 serving；最后接口补丁新增3项，serving全套已重测 |
 | 既有完整回归 | Pi05 API、Cosmos3、registry 全套 pytest：163 passed，59 subtests passed |
 | 目标环境对当前 Cosmos 原始像素 e2e | 七请求/六场景完成，shape/离散合同一致、inactive 槽位零、输出有限；每帧视频质量通过，跨环境 strict bitwise 不成立 |
 | SGLang worker / Python / HTTP | 最终三入口动作逐值一致，13 项 metadata/资产摘要相同；原生与 facade MP4 逐字节一致（86,268 bytes） |
+| 最终参数校验 | Python未支持控制、raw/直接参数冲突均入队前拒绝；12组非法请求0入队，2次有效raw/direct请求动作、normalized、视频与旧基线exact |
 | 错误与生命周期 | 原生 400/facade 422 后恢复；四并发 1×200+3×503、Retry-After=1 后恢复；下载/删除/404、SIGTERM 文件和目录清理通过 |
 | 状态隔离 | Libero → 多 domain/shape/seed → Libero，动作/normalized actions/视频首尾逐元素一致 |
 | 请求内 UND 缓存 | 目标环境六场景×off/on/on/off，共24次 rollout；54组完整动作/normalized/video数组比较全部 exact |
@@ -40,11 +41,13 @@ Review 可从 [pipeline](../python/sglang/multimodal_gen/runtime/pipelines/cosmo
 
 三份单元测试在 CPU 张量上执行，但依赖 Diffusers。既有 hosted CPU CI 只安装 `python[dev]`，因此注册到已有安装 diffusion 依赖的 `base-b-test-diffusion-unit-1-gpu-h100`。CI discovery/validation/filter 已确认三文件均启用、无 skip；没有增加全局 CPU 依赖。私有 checkpoint 不加入公共 CI。
 
+缓存和显存优化后的真实三入口复测共11组动作数组、7份MP4，均与旧结果一致，开关与继承值、下载/删除/404和关闭清理通过，见 [cross_route_summary.json](../artifacts/pwm_wam_1028/und_cache_serving/cross_route_summary.json)。随后修复Python参数合同：仅允许WAM实际消费的字段，拒绝`diffusers_kwargs`以及raw/外层不同值冲突；同值重复兼容，规范化后的请求仍可再次校验。最后两次真实worker请求继续精确一致，12类错误均未入队，证据见 [python_admission/summary.json](../artifacts/pwm_wam_1028/und_cache_serving/python_admission/summary.json)。HTTP的`runtime`包装与Python直接采样字段已在部署说明中区分。
+
 ## 数值结论与边界
 
 当前 Cosmos 和 native leaf snapshot 在相同 Python 3.13 / Torch 2.10 / cuDNN 9.15 下，六种原始像素输入的全宽 Action128、normalized actions、无损 uint8 视频全部逐位一致，max abs=0。该实验没有注入 reference latent。诊断加载器只跳过无关 serving 包初始化，实际计算文件是记录 SHA-256 的原生 snapshot；它证明移植语义，不替代目标 Torch 2.14 的 SGLang worker 验证。
 
-正确性 reference 选择 eager SDPA；FA3+compile 是单独性能对照，未宣称其与 SDPA 逐位一致。Cosmos HEAD 在任务期间有外部提交，最新 smoke 的 manifest 明确记录 `42bea124`。对初始与后续相关 revision 的只读审计确认 model/data/configs/utils、实际 inference entrypoint/args/defaults/action_serving 未变化，20个关键文件 blob/SHA-256 一致；变化集中在未调用的服务优化及诊断工具。早期各场景 revision 的归属由 stderr 时间与 reflog 重建，证据强度低于逐运行 manifest，详见 [source_revision_audit.json](../artifacts/pwm_wam_1028/same_environment/source_revision_audit.json)。
+正确性 reference 选择 eager SDPA；FA3+compile 是单独性能对照，未宣称其与 SDPA 逐位一致。Cosmos HEAD 在任务期间有外部提交，最新 smoke 的 manifest 明确记录 `42bea124`。对初始与后续相关 revision 的只读审计确认 model/data/configs/utils、实际 inference entrypoint/args/defaults/action_serving 未变化，20个关键文件 blob/SHA-256 一致；变化集中在未调用的服务优化及诊断工具。早期各场景 revision 的归属由 stderr 时间与 reflog 重建，证据强度低于逐运行 manifest，详见 [source_revision_audit.json](../artifacts/pwm_wam_1028/same_environment/source_revision_audit.json)。原 `final_matrix_comparison.json` 的 `reference_source_commit=3d2aba0f` 只代表初始 session revision，不能作为每个场景的执行 revision；保留原文件以维持视频质量报告记录的SHA，逐场景来源以该审计为准。
 
 另外重新捕获的 smoke 逐步对照有 52 个边界、49 个整张量 exact；另三个张量只在固定条件帧的 812 个坐标上有 max abs `1.1920929e-7`，**生成视频和动作坐标的差异为零**。native 每步恢复固定坐标为 clean，而 source solver 在这些坐标保留 FP32 舍入；不把这三张量标为 exact。完整方法和证据索引见 [数值验证说明](../test/manual/pwm_wam_validation_notes.md)。
 
@@ -76,7 +79,7 @@ VAE 首差异出现在同值、同 shape/stride/NCDHW layout 的 BF16 residual c
 | 当前 Cosmos SDPA | 4.512 | 3.430 | reference worker 内完整请求 |
 | 当前 Cosmos FA3 + compile | 21.835 | 2.233 | reference worker 内完整请求，首轮含编译 |
 | SGLang Python / worker | 4.443 | 3.239 | `generate_action()`；其中 worker median 3.230、sample median 3.195 |
-| 同环境 SGLang direct runtime | 4.418 | 3.228 | 相同模型/采样实现，直接调用 runtime |
+| 目标 Torch2.14 SGLang direct runtime | 4.418 | 3.228 | 相同模型/采样实现，直接调用 runtime |
 
 初始 SGLang eager 请求比已有 FA3+compile baseline 约慢 **45%**。相较 source SDPA 的差值不能单独归因于框架，因为 Torch/cuDNN 和计算路径不同。FA3、compile 尚未迁入；独立 UND 缓存收益见下文。
 
@@ -84,13 +87,13 @@ VAE 首差异出现在同值、同 shape/stride/NCDHW layout 的 BF16 residual c
 
 另测短 smoke（3 steps、CFG1、4 actions/5帧、带视频 decode）：GPU1、每种模式预热3次，5组ABBA，每种10个样本。off平均 **0.313904 s**，on平均 **0.272644 s**，延迟下降 **13.1443%**；动作、normalized actions和视频全部 exact。该版本包含CPU文本头优化，两组采用相同权重布局；计时仍不含加载、MP4和HTTP。前一轮质量矩阵的单组smoke曾出现缓存慢17%的波动，因此补了本轮重复验证，没有删除先前样本；单轮矩阵不作为性能结论。完整数据见 [und_cache_short_request/comparison.json](../artifacts/pwm_wam_1028/und_cache_short_request/comparison.json)。缓存收益依赖请求，默认仍关闭，可显式开启。
 
-独立显存优化将未使用的 `language_model.lm_head.weight` 保留在CPU，所有key/shape/dtype和数值继续严格检查；不删除参数、不绑定embedding、不改变推理计算。模型加载总字节仍为32,364,191,504，CUDA部分31,119,531,792，精确减少 **1,244,659,712 bytes（1.159 GiB）**。GPU3的匹配ABBA全宽动作与旧基线exact；cache-off/on峰值allocated分别为 **33,523,971,072 /33,560,925,184 bytes**。跨卡峰值比旧结果额外少1 MiB，这部分未归因于权重，也未据此声称延迟收益。加载字段不含VAE和激活，设备明细与对照见 [unused_head_cpu_validation/comparison.json](../artifacts/pwm_wam_1028/unused_head_cpu_validation/comparison.json)。
+独立显存优化将未使用的 `language_model.lm_head.weight` 保留在CPU，继续严格检查key/shape/dtype，并无损保留权重值；不删除参数、不绑定embedding、不改变推理计算。loader未执行全权重数值比对或有限性扫描。模型加载总字节仍为32,364,191,504，CUDA部分31,119,531,792，精确减少 **1,244,659,712 bytes（1.159 GiB）**。GPU3的匹配ABBA全宽动作与旧基线exact；cache-off/on峰值allocated分别为 **33,523,971,072 /33,560,925,184 bytes**。跨卡峰值比旧结果额外少1 MiB，这部分未归因于权重，也未据此声称延迟收益。加载字段不含VAE和激活，设备明细与对照见 [unused_head_cpu_validation/comparison.json](../artifacts/pwm_wam_1028/unused_head_cpu_validation/comparison.json)。
 
 缓存 trace 的 self CUDA 时间主要为 GEMM 38.16%、cuDNN attention 28.08%，其余为逐元素、cast、norm 等。单 trace 未建立 overlap 收益；自动分析器基于 `nvjet` 名称给出的 FP8 提示不适用于本 BF16 模型。已保留未缓存 trace、缓存 trace、算子表和三表分析，后续 FA3/compile/norm/RoPE 优化应逐项验证舍入、完整动作与视频，不能直接套用其他模型的融合。
 
 这是共享节点上的小样本基线，没有锁定整机独占资源，也没有置信区间/统计显著性结论。收尾时其他 GPU 作业已出现，未操作这些外部进程。
 
-同环境 direct runtime 与 Python/worker 的动作逐元素一致，六次重复也一致。两条路径 warm median 相差约 11.2 ms；Python 同请求的调用耗时减 worker 耗时，中位数约 10.1 ms。direct runtime 峰值 allocated **34,770,594,816 bytes（34.77 GB /32.38 GiB）**、reserved 35,383,148,544 bytes；这是上述无解码 workload 的 allocator 指标，不含 CUDA context/驱动开销，也不代表最大视频 shape。Python 父进程 `parent_peak_allocated_bytes=0` 不代表 worker 不占显存。完整六次结果见 [benchmark/summary.json](../artifacts/pwm_wam_1028/benchmark/summary.json)。
+目标Torch2.14环境的 direct runtime 与 Python/worker 动作逐元素一致，六次重复也一致。两条路径 warm median 相差约 11.2 ms；Python 同请求的调用耗时减 worker 耗时，中位数约 10.1 ms。初始direct runtime峰值allocated **34,770,594,816 bytes（34.77 GB /32.38 GiB）**、reserved 35,383,148,544 bytes；这是上述无解码workload在显存优化前的allocator指标，不含CUDA context/驱动开销，也不代表最大视频shape。Python 父进程 `parent_peak_allocated_bytes=0` 不代表 worker 不占显存。完整六次结果见 [benchmark/summary.json](../artifacts/pwm_wam_1028/benchmark/summary.json)。
 
 原尺寸带视频矩阵重放 Python e2e 5.001 s、worker 4.618 s，其中 sample 3.181 s、finalize/decode 1.402 s。HTTP 小 smoke 的带视频单次请求为 native 0.433 s、facade 0.468 s，包含 MP4 编码及响应传输；未单独测量 MP4 编码，也未做 HTTP 压测。这些都不是无视频 benchmark 的同口径样本，不据此比较框架速度。
 
@@ -142,5 +145,7 @@ env LD_LIBRARY_PATH='' PYTHONPATH=python CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=
 - `test/manual/test_cosmos_pwm_wam.py`：实权重 runtime/Python 验证；`test/manual/pwm_wam_*.py`：source 捕获与层/VAE 回放。
 
 SGLang 起点 `990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；native 核心来源 `vllm-omni-pwm` `d3e9aad33e861b69be16c4f341695e1cc12b3314`。主要本地 checkpoint：`0d1efb0380`（范围）、`92e50e09b2`（三塔）、`629925c278`（请求/采样）、`39dc0c1c49`（服务）、`a2dd639bda`（SDPA/合同）、`9a2a260afe`（诊断）、`66643efca1`（下载）、`0224fcb2ba`（资产/CI）。收尾提交通过 `git log 990ee89877..HEAD --oneline` 查看。
+
+后续实现/验证提交：`4736596b7c`（请求内UND缓存与ABBA工具）、`7f8d26bff6`（同环境与视频质量诊断）、`29495faae6`（未使用文本头CPU常驻）、`455d63f168`（source revision审计说明）、`f616e8eb13`（Python参数严格校验与回归）。最终本地检查日志为 `final_admission_style.log`，完整既有回归为 `final_existing_optimized.log`，最终新增接口回归为 `und_cache_serving/python_admission_cpu.log`。这些是本机验证，没有宣称远端CI已运行。
 
 私有权重、大体积输出和 `.venv` 未加入 Git；完整证据保留于本机 `artifacts/pwm_wam_1028/`。没有推送远端、创建 PR、修改其他 checkout 或停止外部 GPU 作业。
