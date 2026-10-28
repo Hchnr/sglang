@@ -33,3 +33,9 @@ All frames pass the fixed video-only gates SSIM >= 0.92 and PSNR >= 24 dB. The g
 ```bash
 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 .venv/bin/python test/manual/pwm_wam_video_quality.py --comparison artifacts/pwm_wam_1028/final_matrix_comparison.json --output artifacts/pwm_wam_1028/final_video_quality.json
 ```
+
+## Target-environment UND-cache matrix
+
+The actual SGLang runtime in Torch 2.14.1 / Diffusers 0.37.0 / Transformers 5.19.0 was also tested on the same six unique requests, with cache disabled/enabled/enabled/disabled for each case. The existing `test/manual/test_cosmos_pwm_wam.py` harness used `--route runtime --und-cache compare --warmup 1`. One untimed warmup per mode preceded 24 saved rollouts. All 54 comparisons of full-128 physical actions, normalized actions and uint8 video were exact, with maximum absolute difference zero. These cases exercise CFG=1, conditional/unconditional CFG, independent action/video rates, several action domains, 30 default solver steps and video output. Cache remains disabled by default.
+
+Evidence is in `../und_cache_matrix/summary.json`, `../und_cache_matrix/acceptance.json`, and result directories `000` through `023`. `../und_cache_matrix_command.json` preserves every argument and environment setting. `../und_cache_matrix_provenance.json` and `../und_cache_matrix_diff.patch` record the HEAD, working-tree diff and leaf-file hashes; every leaf hash was unchanged after the run. The GPU-1 audit contains only the diagnostic process, and GPU 1 was released afterward. This matrix establishes output parity; its single-pass timing data is not a standalone performance claim.
