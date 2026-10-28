@@ -138,3 +138,14 @@ UND 只对自身做 causal attention，不读取 VIDEO/ACTION，也不读取 tim
 GPU0 初查空闲，导入期间外部任务占约 50 GB，第一次诊断加载 OOM；本任务退出并保留日志，没有采样结果或性能数据。外部任务随后自行结束，复查空闲后才重试。其他三卡有外部任务，未操作它们。
 
 18:41 更新：UND cache 版本 CPU 验证完成，model 9/9、runtime 17/17、serving 12/12，共38项通过。配置/API/内部cache与诊断benchmark工具单独本地提交；默认关闭，GPU一致性和性能暂不宣称通过。第二次同环境诊断遇外部新任务，supervisor检测到第二GPU进程后仅终止本任务，避免第二次OOM；脚本/环境/原生leaf snapshot SHA与资源审计保留。
+
+## 2026-10-28 18:55：同环境正确性闭环与 UND 缓存实测
+
+- 请求内 UND 复用及显式开关提交 `4736596b7c`，当前默认关闭，保留逐步骤重新计算的数值基线。模型、runtime、serving CPU 测试合计 38 项通过。
+- 当前 Cosmos 与未改写数学运算的 native leaf snapshot 在相同 Python 3.13 / Torch 2.10 / cuDNN 9.15 下，六个原始像素场景的全宽 Action128、normalized actions、uint8 视频全部逐位一致。没有注入 reference clean latent；隔离只跳过无关 serving 包初始化，离线诊断不等同于目标环境部署。命令、leaf SHA 和加载路径见 `same_environment/native_matrix_gpu1/isolation_manifest.json`。
+- 新采集 smoke 的 52 个过程边界中 49 个整张量精确一致。另 3 个张量仅在固定条件帧的 812 个坐标有 `1.1920929e-7` 的 FP32 末位差异；生成视频坐标和动作坐标的差异均为零。native 每步将固定坐标恢复为 clean，source solver 在这些坐标保留舍入误差。没有将这三张量重新标为 exact。详见 `same_environment/native_smoke/{roundoff_location,fixed_coordinate_check}.json`。
+- 目标 Torch 2.14 / cuDNN 9.24 对 source 2.10 / 9.15 的六场景及 Libero 重放视频，每帧均通过固定 SSIM≥0.92、PSNR≥24 dB。最差 DROID frame 32 为 0.9327856 / 24.912619 dB。方法与逐帧值见 `final_video_quality.json`；此结论不定义动作单位容差或机器人任务成功率。
+- GPU2/H10080GB 固定 Libero 960×640、40 actions/41 frames、5 steps、CFG1.5、shift5、seed42、无 decode：各模式预热一次，执行三组 off/on/on/off。off 六次平均 3.257093 s，on 六次平均 3.154454 s，均值延迟下降 **3.1512%**；全部动作及 normalized actions exact。额外两次 profiler 输出也 exact。缓存峰值 allocated 增加 36,954,112 bytes；后续独立 CPU-head 优化不包含在这组数据中。
+- 本组运行加载的是 `4736596b7c`；监督器确认目标 GPU 仅有该推理进程，无外部进程冲突，退出码 0。完整命令、GPU 审计、12 份输出、两份 trace 和统计保存在 `und_cache_validation/`。没有根据带 profiler 的耗时计算提速。
+- 使用 `llm-torch-profiler-analysis` 的单 trace 分析整理两条 native trace。算子表显示 GEMM 38.16%、cuDNN attention 28.08%，余下主要为逐元素、cast 和 norm。自动分析器把 `nvjet` 模式提示为 FP8 替换候选，但本模型实际 BF16，**该提示不适用**；未据此引入量化或声称可直接复用 FP8 kernel。单 trace 不能建立可重叠执行的收益结论。
+- 多场景 cache-on 视频与真实 Python/HTTP/facade 验证、未使用文本输出头的 CPU 常驻显存实测继续进行。仍不声称已超过当前 Cosmos FA3+compile 基线。
