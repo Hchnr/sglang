@@ -73,6 +73,14 @@
 - 新增mean回归采用真实CPU Dynamo图执行和opcheck，覆盖8种2D/3D、FP32/BF16、连续/非连续输入，验证原eager输出、FP32归约、fake metadata与非alias。模型14项通过，旧forward红灯/新forward绿灯。CPU进程用`CUDA_VISIBLE_DEVICES=9`（本机只有0..3）绕过test_utils对空字符串的索引问题，device_count=0且CUDA未初始化，不占GPU0；不再需要之前的临时环境读取patch。
 - 部署文档改为显式推荐Hopper FA3+compile+UND缓存，并保留eager对照方法；类默认值未隐式切换。数值策略和首次编译成本写入说明。
 
+### 决策 D19：用最终生产代码重新验收
+
+- `e9be9ec135` 冻结后，GPU0运行未替换的生产runtime：6场景各off/on/on/off，再回访Libero，共28请求。22组重复/回访、66个完整Action128/normalized/video数组全部exact，前后源码SHA一致，无GPU0外部并发。`final_boundary_quality/command.json` 和 `acceptance_summary.json` 保存证据。
+- 相对同环境Cosmos FA3 eager，6场景视频全部逐像素exact（共134帧，SSIM=1/PSNR∞）。4场景全宽动作/normalized exact；DROID仅一个值physical差1.164153218e-10、normalized差7.450580597e-9；Robotwin仅一个值physical/normalized差5.960464478e-8。保留这些FP32末位差异，不宣称所有动作bitwise，也不由此推断机器人闭环成功率。
+- 相对Cosmos compile仍保留原有DROID差异：源compile自身对源eager未通过原固定视频门槛。未改源数学/配置、未降低SSIM0.92/PSNR24dB门槛；完整三组对照均保留在 `final_boundary_quality/comparison.json`。
+- 为覆盖此前首次shape导致的漂移，再以全新进程/编译缓存在GPU3执行DROID-first→smoke→DROID，各off/on/on/off；与GPU0 smoke-first矩阵交叉比较，不使用artifact monkeypatch。
+- 新增model14项通过。最终CPU重跑初次为runtime+serving31pass/1fail：配置测试的自动显存查询实际尝试CUDA，而不是生产推理回归。仅在该unit测试隔离外部 `current_platform.get_available_gpu_memory` 查询（返回80GiB），真实ServerArgs解析/拒绝逻辑保留；重跑32passed+65subtests，device_count0、CUDA未初始化。原失败日志和修复后日志均在 `mean_regression/`，最终WAM单测合计46项。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。

@@ -347,8 +347,17 @@ class TestCosmosPWMWAMServing(CustomTestCase):
         self.assertEqual(params.build_request_extra(), expected)
 
     def test_unsupported_optimization_settings_fail_during_server_resolution(self):
-        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs, auto_tune
 
+        # Configuration resolution queries device memory even with offload
+        # disabled. Keep this CPU contract test independent of real CUDA state.
+        self.enterContext(
+            patch.object(
+                auto_tune.current_platform,
+                "get_available_gpu_memory",
+                return_value=80.0,
+            )
+        )
         kwargs = {
             "model_path": str(self.root),
             "backend": "sglang",
