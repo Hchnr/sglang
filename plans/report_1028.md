@@ -1,6 +1,6 @@
 # 三塔 PWM WAM 接入 SGLang：结论
 
-2026-10-29 更新。原生接入和最终质量回归已完成；修正后的生产 runtime 比同时开启 compile 与 FlashAttention 3 的 Cosmos Baseline 快 **6.50%**。真实 Python worker 的最终配对测速正在重跑，完整性能验收尚未关闭。本文取代此前 eager 阶段结论；旧结果和失败实验继续保留于实施记录、Git 历史和 artifacts。
+2026-10-29 最终结论：指定checkpoint的单GPU/B1原生WAM接入、质量验证和性能验收已完成。相对同时开启compile与FlashAttention 3的Cosmos Baseline，稳定态runtime延迟下降 **6.50%**，真实Python worker（含通信）下降 **7.51%**。六场景134帧视频与同环境源FA3 eager逐像素一致；动作误差和支持边界如下。本文取代此前eager阶段结论，旧结果和失败实验继续保留于实施记录、Git历史和artifacts。
 
 生产数值修复为 `e9be9ec135`，后续提交仅涉及测试和文档。完整决策与提交过程见 [record_1028.md](record_1028.md)，原始设计见 [plan.md](plan.md)，实际部署命令见 [README](../examples/diffusion/cosmos_pwm_wam/README.md)。
 
@@ -11,9 +11,20 @@
 | 比较路径 | Cosmos compile+FA3 | SGLang compile+FA3+UND cache | 延迟下降 |
 | --- | ---: | ---: | ---: |
 | 直接生产 runtime | 2.288877 s | 2.140096 s | **6.50%** |
-| 实际 Python worker（含 IPC） | 重跑中 | 重跑中 | 尚未结论 |
+| 实际 SGLang Python worker（含 IPC） | 2.313668 s | 2.139875 s | **7.51%** |
 
-runtime 每端16个 measured 样本，中位数汇总；C/S/S/C 为四个独立加载进程，各自首次请求单列、预热3次、测量8次，保留全部离群值。速度比为1.06952×；平均值分别2.313672/2.163292 s。首次请求分别包含编译/缓存成本，不混入稳定态样本。原始结果见 [comparison.json](../artifacts/pwm_wam_1029/final_boundary_runtime/comparison.json)。
+两组各自完整C/S/S/C，均为四个独立加载进程，每端16个measured样本、中位数汇总。每进程首次请求单列、预热3次、测量8次，保留全部离群值。共8个有效进程、96次请求，其中64次正式测量。Cosmos两组均调用原始直接推理接口；第二组的通信成本计入SGLang实际worker。
+
+runtime速度比为1.06952×，平均值C/S分别2.313672/2.163292 s；worker速度比为1.08122×，平均值C/S分别2.330083/2.146196 s。原始结果见 [runtime对照](../artifacts/pwm_wam_1029/final_boundary_runtime/comparison.json)、[worker对照](../artifacts/pwm_wam_1029/final_boundary_worker_retry/comparison.json) 和 [完整统计/逐样本质量汇总](../artifacts/pwm_wam_1029/final_boundary_summary.json)。
+
+| 对照组/实现 | 两次构建耗时 s | 两次首请求 s |
+| --- | --- | --- |
+| runtime /Cosmos | 54.366 /39.764 | 31.579 /10.496 |
+| runtime /SGLang | 39.673 /31.592 | 24.731 /7.670 |
+| worker组 /Cosmos | 30.946 /29.030 | 28.065 /13.499 |
+| worker组 /SGLang | 129.550 /78.400 | 24.763 /11.175 |
+
+构建包含工具中的模型/worker初始化，受NFS与导入影响；不是纯权重加载或稳定态推理。每组各实现从新编译缓存开始，组内后续进程共享其磁盘缓存，因此不能把后一次首请求称作完全冷启动。首次编译耗时不混入稳定态样本。两组在不同时段运行，不能用SGLang两个中位数相减估计IPC成本；逐请求wall减runtime自计时的中位差为direct0.495ms、worker10.711ms，包含协议、调度及IPC。
 
 计时从媒体/请求准备开始，到物理动作到达CPU结束；不含模型加载、NPZ/JSON保存、MP4编码或HTTP。Python路径另含真实worker通信。该结果是指定请求的稳定态延迟，不代表吞吐、P99、所有分辨率或所有domain的收益。
 
@@ -26,6 +37,10 @@ runtime 每端16个 measured 样本，中位数汇总；C/S/S/C 为四个独立�
 - 每块记录GPU进程、功率/时钟、源码和harness SHA、依赖/扩展来源、完整首次/预热/测量输出。未锁定整机独占，也未计算统计显著性或置信区间。
 
 源在目标Transformers5环境仅恢复未使用Edge processor依赖的`get_image_size`旧re-export；WAM数学路径不变。该只读兼容overlay及函数SHA由manifest记录。源FA3仍为其原`flash_attn_3_nv`，原生为`sgl_kernel.flash_attn`，没有把两者伪称为同一个provider。
+
+源有效精度另经 [只读审计](../artifacts/pwm_wam_1029/final_boundary_runtime/cosmos_effective_precision_audit.json)：620份manifest源码SHA匹配，构造函数显式关闭两项TF32，实际请求/模型/VAE/solver路径未见内层重新开启；日志和生成图确认compile、FA3及完整三塔联合生成，未发现减步数/CFG等捷径。
+
+最终GPU监督从空闲开始、结束后再次清空。容器无法把NVML的host PID与/proc的namespace PID一一映射；worker采用parent/worker进程树与GPU fd、最多两个CUDA context及稳定GPU PID集合的关联审计。该能力边界和零样本监督误判/全新重跑均在record中说明，未把中止轮计入统计。
 
 ## 最终质量与状态隔离
 
@@ -44,9 +59,11 @@ runtime 每端16个 measured 样本，中位数汇总；C/S/S/C 为四个独立�
 
 共134帧，SSIM=1、PSNR=∞；固定逐帧门槛仍为SSIM≥0.92、PSNR≥24dB，未放宽。DROID/Robotwin各有一个FP32动作值存在上述末位差异，不宣称全矩阵动作bitwise；也不把数值验证转化为机器人闭环成功率结论。完整active/full-width误差、逐帧得分和三组source/native比较见 [comparison.json](../artifacts/pwm_wam_1029/final_boundary_quality/comparison.json)，简表见 [acceptance_summary.json](../artifacts/pwm_wam_1029/final_boundary_quality/acceptance_summary.json)。
 
-每个场景off/on/on/off，之后回访Libero，共28请求；22组重复/回访、66个完整动作/normalized/video数组比较全部exact。另一全新进程与编译缓存以DROID-first→smoke→DROID运行12请求，36数组与上述smoke-first矩阵exact，见 [首次shape交叉](../artifacts/pwm_wam_1029/final_boundary_droid_first/cross_first_shape_comparison.json)。最终runtime两个独立进程的24次首次/预热/正式主尺寸动作和normalized也全部与源FA3 eager exact。
+每个场景off/on/on/off，之后回访Libero，共28请求；22组重复/回访、66个完整动作/normalized/video数组比较全部exact。另一全新进程与编译缓存以DROID-first→smoke→DROID运行12请求，36数组与上述smoke-first矩阵exact，见 [首次shape交叉](../artifacts/pwm_wam_1029/final_boundary_droid_first/cross_first_shape_comparison.json)。最终runtime两个进程的 [24次主尺寸动作和normalized](../artifacts/pwm_wam_1029/final_boundary_runtime/source_eager_main_comparison.json)，以及两个真实worker的24次输出，包含首次/预热/正式样本，共48次完整数组均对源FA3 eager和最终质量矩阵主场景双锚点exact；逐样本证据在完整统计中。
 
 源compile自身在DROID相对源eager存在明显漂移，最差SSIM0.875546、PSNR20.1516dB，未通过同一视频门槛。因此不能用源compiled输出替代原始数值语义，也不能把它当作允许本实现漂移的容差。最终native相对该compiled输出的差异仍披露在完整比较中，未修改Baseline数学或隐藏该结果。
+
+源compiled主尺寸动作在不同新磁盘编译缓存组之间也不是bitwise，同组首次/预热/重复则稳定；源码620文件、参数、软件和TF32策略相同。该差异见 [源编译重复性](../artifacts/pwm_wam_1029/final_boundary_cosmos_compiled_reproducibility.json)。它没有被用于放宽本实现门槛；最终native四个fresh进程仍对原eager动作exact。
 
 ## 实际接入与修正
 
@@ -70,7 +87,7 @@ UND缓存仅复用同一请求、同一CFG分支的条件；false保留每步重
 | CPU环境独立性 | 最终runtime+serving32passed+65subtests；仅隔离配置测试的外部显存查询，CUDA未初始化，失败/修复日志均保留 |
 | 既有公共回归 | 此轮先前Cosmos3/Pi05/registry完整163passed+59subtests；末次RMS修复后重跑上述WAM46项及全部实权重最终验证，不把旧公共回归伪称为新HEAD远端CI |
 | 真实native HTTP与facade | 最终8请求、16项动作/normalized比较exact，8个MP4逐字节一致；实际worker FA3+compile、双TF32=false |
-| 服务错误/资源清理 | 非法cache字段native400/facade422后恢复；下载/删除/404、SIGTERM留存视频清理通过，全部我方进程退出/GPU1清空 |
+| 服务错误/资源清理 | 非法cache字段native400/facade422后恢复；下载/删除/404、SIGTERM留存视频清理通过，上述HTTP/facade服务进程全部退出/GPU1清空 |
 | 静态检查 | 修改Python的仓库选定Ruff规则、format、isort以及`git diff --check`通过 |
 
 HTTP视频均5帧176×256@20FPS，85,023bytes；实际加载`sgl_kernel/flash_ops.abi3.so`由worker maps核对。服务证据见 [acceptance.md](../artifacts/pwm_wam_1029/final_boundary_serving/acceptance.md) 与 [跨入口比较](../artifacts/pwm_wam_1029/final_boundary_serving/cross_service_summary.json)。该smoke验证服务合同，不替代原尺寸质量矩阵。原生监督脚本曾过早检查自然退出的编译子进程，保留原始snapshot，宽限轮询后确认全部退出；没有额外kill外部进程。
@@ -110,4 +127,4 @@ GPU手工验证使用 [test_cosmos_pwm_wam.py](../test/manual/test_cosmos_pwm_wa
 
 本轮主要提交：`495e9cc5bc`/`0192b1edf3`/`fdd689092d`（FA3与compile接线）、`ee7c4c35fa`（公平基准工具）、`fc60830b1d`（共享动态编译边界）、`2f499c22b3`（请求内TF32策略）、`e9be9ec135`（保留归约/BF16舍入）、`9235da1b95`（数值回归/部署）、`e41e1e5f06`（CPU测试硬件查询隔离）。详细历史见record及`git log 990ee89877..HEAD --oneline`。
 
-私有权重、数组、编译缓存和`.venv`未加入Git，证据保留在本机artifacts。没有推送远端、创建PR、修改其他checkout或停止外部GPU作业。
+本任务的服务、worker及验证进程均已退出；收尾GPU compute进程列表为空、视频store清空。私有权重、数组、编译缓存和`.venv`未加入Git，证据保留在本机artifacts。没有推送远端、创建PR、修改其他checkout或停止外部GPU作业。

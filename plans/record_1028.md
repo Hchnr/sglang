@@ -89,6 +89,15 @@
 - 最终worker性能组的首个S块在分布式初始化时被artifact supervisor误中止（0采样输出）：真实Python入口正常创建parent CUDA context及worker context，计数>1的旧规则将第二个context误判为外部进程。保留`final_boundary_worker/`为监督失败证据，不纳入性能统计；在新目录`final_boundary_worker_retry/`重新执行完整C/S/S/C，不改生产/harness。
 - 本容器的NVML返回host PID，而/proc只提供本namespace PID，无法严谨一一映射。保守监督改为GPU起止空闲、runtime/C最多1个context、Python最多2个；接纳第二个前须有namespace parent+worker两份GPU fd证据，之后PID集合保持稳定，替换/超限只终止自己的进程组。每2秒保存两侧PID/命令/PPid/NSpid/fd和GPU显存/时钟，明确监测能力边界，不伪称获得host权限或精确PID映射。
 
+### 决策 D21：关闭指定单GPU/B1范围的最终验收
+
+- `final_boundary_worker_retry/` 全新C/S/S/C完整完成，各方16 measured，C median2.313667792 s、S worker median2.139874681 s，延迟下降7.5116%、1.081216×。8个最终有效进程（runtime与worker各4个）均exit0、生产源码SHA不变，96次请求中64次正式测量；GPU审计无超限/替换，全部退出后GPU空闲。
+- 最终runtime C2.288876745/S2.140096151 s（下降6.5002%）和上述worker数据分别来自独立同卡配对组。48次native first/warm/measured的完整128维动作及normalized对Cosmos FA3 eager、最终quality主场景双锚点全部exact。完整原始样本、构建/首次请求、源码和版本汇总 `final_boundary_summary.json`；不把worker略低于direct的中位数解读成通信零成本，逐请求wall−runtime.total中位差分别0.495/10.711ms，后者包含协议/调度/IPC。
+- 源有效精度独立审计完成：620份manifest源文件匹配，构造函数明确关闭TF32；实际请求/网络/VAE/solver及provider无内层重新开启，compile/FA3/metadata复用/完整联合latent都有callsite和生成图证据。`final_boundary_runtime/cosmos_effective_precision_audit.json` 仅只读审计，不假装是逐算子capture。
+- 另外保留源compiled自身的跨编译缓存漂移：相同源码/软件/策略/请求，不同fresh磁盘cache组的完整主尺寸动作有差异，同组重复稳定。`final_boundary_cosmos_compiled_reproducibility.json`记录，不由此放宽本实现质量门槛。原生四fresh进程保持对eager动作exact。
+- 当前支持范围的原生接入、质量和加速目标已完成；最终报告和部署recipe按实际支持能力重写。46项WAM单测、六场景134帧、不同首次shape、实际runtime/worker、两HTTP入口均有证据。动作矩阵两个单值末位差异、非干净容器环境和未运行远端CI等边界明确保留，未推广为业务闭环成功率或所有shape/硬件收益。
+- 所有本任务服务/worker/验证进程退出，收尾GPU compute列表为空、视频stores清空。只在本分支频繁本地提交，没有远端推送、外部checkout写入或停止外部作业；源码最后数值修复为`e9be9ec135`，之后均tests/docs变更。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。

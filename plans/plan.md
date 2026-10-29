@@ -1,6 +1,6 @@
 # 三塔 PWM WAM 推理接入 SGLang 的调研与实施计划
 
-> 2026-10-29 验收补充：用户要求接入后的单 GPU/B1 WAM 推理快于同时开启 compile 和 FlashAttention 3 的 Cosmos Baseline。前期 eager SDPA 仅是对齐阶段；接下来补齐原生 FA3/compile，以同资产、输入、软件环境和计时边界的稳定态实测及输出验证验收。进度与最终证据见 record_1028.md / report_1028.md。
+> 2026-10-29 验收补充：用户要求接入后的单GPU/B1 WAM推理快于同时开启compile和FlashAttention 3的Cosmos Baseline。已补齐原生FA3/compile并修复编译数值漂移，同环境最终runtime/实际worker稳定态延迟分别下降6.50%/7.51%，六场景质量及服务验证完成。具体范围、保守决策和最终证据见 [record_1028.md](record_1028.md) / [report_1028.md](report_1028.md)。
 
 文档性质：2026-10-28 的调研与原始实施计划。最初交付时仅完成规划；用户随后已授权实现、测试与性能优化。下文的“尚未开始”“后续”均描述规划时点，当前实现、冻结资产和实际结果以 [实施记录](record_1028.md) / [结论](report_1028.md) 为准。
 
