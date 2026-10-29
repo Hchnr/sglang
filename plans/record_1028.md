@@ -45,6 +45,15 @@
 
 随后另采有效 IEEE 策略一致的 C/S/S/C，对照 compile+FA3、同软件栈/同输入/同GPU；保留两组全部数据，不删除第一次 cache gate/默认policy benchmark。C 原生配置不改，只有 S 修正其默认数值策略。采样工具在各完整组结束前保持同一SHA，汇总分析再增强有效/外部policy和harness身份检查。
 
+### 决策 D16：性能通过不能覆盖质量矩阵失败
+
+- 同有效IEEE策略的正式runtime对照共16 measured/实现：C median 2.299706 s、S median 2.017423 s（延迟下降12.2747%、1.13992×）。真实Python worker对照：C 2.296959 s、S 2.024113 s（含worker IPC）；首轮/3轮warmup/全部原始样本保留。两端均compile+FA3，无视频decode但完整联合生成；分别见 `fair_ieee/` 和 `fair_worker_ieee/`。
+- 显式SGL FA3 provider的IEEE主请求4次与六场景+回访28次，全部cache off/on/回访的全宽动作、normalized与uint8视频exact。源码前后一致，实际FP32 flags均False。真实provider审计为sgl-kernel；未使用community fallback或Cosmos训练代码。
+- 原生与Cosmos跨编译上下文不是bitwise。S formal两次fresh-process相互exact，但独立质量进程/worker/不同首次shape会有差异；发现归一化reduction的自动调优R0_BLOCK在2048/4096之间不同，而归一化后完整generation源码相同。此为可证明配置差异，尚不能据缓存文件把所有输出差异归因于它。
+- 同环境6场景对照发现DROID case2末帧失败：native compile vs Cosmos compile 最差SSIM=0.891880、PSNR=20.4875 dB；Cosmos自身compile vs eager也失败（0.875546/20.1516）；native compile vs Cosmos eager为0.932534/22.728 dB，仍未达到固定PSNR24 dB。其余5场景逐帧通过。源自身漂移不能充当本实现通过门槛的证据，未调低阈值。
+- 整体验收保持未完成，继续GPU0区分native FA3 eager、SDPA eager和编译路径的DROID输出，研究确定性归约等保守数值策略。已通过速度测量不替代此质量工作；所有失败和早期策略样本继续保留。
+- CPU新模型13、runtime17、serving15合计45项；原有Cosmos3/Pi05/registry回归163 passed +59 subtests。IEEE作用域新增断言已用旧forward实际红灯/当前绿灯验证，证据 `ieee_review/`。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。
