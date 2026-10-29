@@ -80,6 +80,7 @@
 - 相对Cosmos compile仍保留原有DROID差异：源compile自身对源eager未通过原固定视频门槛。未改源数学/配置、未降低SSIM0.92/PSNR24dB门槛；完整三组对照均保留在 `final_boundary_quality/comparison.json`。
 - 为覆盖此前首次shape导致的漂移，再以全新进程/编译缓存在GPU3执行DROID-first→smoke→DROID，各off/on/on/off；与GPU0 smoke-first矩阵交叉比较，不使用artifact monkeypatch。
 - 新增model14项通过。最终CPU重跑初次为runtime+serving31pass/1fail：配置测试的自动显存查询实际尝试CUDA，而不是生产推理回归。仅在该unit测试隔离外部 `current_platform.get_available_gpu_memory` 查询（返回80GiB），真实ServerArgs解析/拒绝逻辑保留；重跑32passed+65subtests，device_count0、CUDA未初始化。原失败日志和修复后日志均在 `mean_regression/`，最终WAM单测合计46项。
+- DROID-first生产验证已完成：12请求、36个数组与GPU0矩阵逐元素exact，独立进程/独立编译缓存、不同首次shape的漂移未再出现。主尺寸正式runtime C/S/S/C各16 measured，C median2.288876745 s、S median2.140096151 s，延迟下降6.500163%；两次native fresh process包含first/warm/measured的24组完整动作/normalized均与Cosmos FA3 eager精确一致。实际生成图prefill/gen分别4/9个原mean边界、7/14个mm、addmm均0，见 `final_boundary_runtime/production_compiled_boundaries.json`。worker组继续独立测量，未提前作为通过。
 
 ## 2026-10-28 16:43：开始实施
 

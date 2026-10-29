@@ -1,8 +1,12 @@
 # 三塔 PWM WAM 接入 SGLang：结论
 
-> 2026-10-29 最新状态：原生 FA3、动态 compile 和请求内 IEEE 精度策略已补齐。同软件栈/同 GPU/同请求的稳定态 C/S/S/C 测量中，runtime 从 Cosmos 2.299706 s 降到 SGLang 2.017423 s，延迟下降 12.27%；真实 Python worker（含 IPC）为 2.024113 s，对照 2.296959 s，下降约 11.88%。但同环境视频质量矩阵的 DROID 末帧未达到原固定 PSNR/SSIM 门槛，仍在定位，**整体目标尚未验收完成**。下文 10/28 的“完成”是历史阶段记录，不能代表新性能与质量验收已完成。
+> 2026-10-29 最新状态：生产代码 `e9be9ec135` 已修复编译数值漂移。相同软件环境、GPU与请求下，新一轮 C/S/S/C 的稳定态 runtime 中位数由 Cosmos **2.288877 s** 降至 SGLang **2.140096 s**，延迟下降 **6.50%**；两端均 compile+FA3、有效FP32 IEEE策略一致。真实Python worker正在重新验收，尚未用直接runtime替代完整worker结论。
 
-> 后续定位：保留原ATen RMS mean、关闭改变BF16中间舍入的Inductor pattern rewrite后，诊断候选的DROID33帧已与同环境Cosmos FA3 eager逐像素一致，动作差异恢复到1.164e-10。正在落地并重跑六场景与性能；上述12.27%是修复前版本的历史数字，不能预先作为最终版本收益。
+> 质量：未替换的生产代码六场景134帧视频均与同环境Cosmos FA3 eager逐像素一致；4场景完整动作一致，DROID/Robotwin各一值的FP32差异分别最多1.164e-10/5.960e-8。28请求cache/回访66数组比较exact；另12请求新进程DROID-first与smoke-first交叉36数组exact。参考 [质量汇总](../artifacts/pwm_wam_1029/final_boundary_quality/acceptance_summary.json) 与 [首次shape交叉](../artifacts/pwm_wam_1029/final_boundary_droid_first/cross_first_shape_comparison.json)。修复前12.27%/11.88%的数据只保留为历史，不能作为最终版本收益。
+
+## 10/28 历史阶段结论
+
+以下保留原始功能与eager阶段证据；其中“尚未迁入/不支持compile”、41项测试、旧路径和性能数字均属于该时点，当前配置见 [部署说明](../examples/diffusion/cosmos_pwm_wam/README.md)，实施进展见 [record_1028.md](record_1028.md)。
 
 已完成本轮单GPU/B1范围的原生WAM接入、正确性验证和两项保守优化。同环境Cosmos-vs-native六场景的动作及视频逐位一致，目标环境的缓存开关/三入口互比也逐位一致。UND缓存相对未缓存路径实测延迟下降 **3.15%**（原尺寸无视频decode）和 **13.14%**（带视频短请求），GPU模型权重减少 **1.159 GiB**。最终审查发现的Python参数静默忽略问题已修复并经真实worker验证；所有本任务服务和worker均已退出。
 
