@@ -551,8 +551,8 @@ class PwmWamTransformer(nn.Module):
     ) -> None:
         """Select execution once at startup without changing checkpoint keys.
 
-        Compiled callables specialize on each request shape and cache branch.
-        They retain weights and executable graphs, never request tensors/KV.
+        Sequence lengths stay symbolic while head/weight dimensions are fixed.
+        Callables retain weights and executable graphs, never request tensors/KV.
         Compilation failures propagate rather than silently executing eagerly.
         """
         if attention_backend not in ("sdpa", "flash3"):
@@ -575,7 +575,7 @@ class PwmWamTransformer(nn.Module):
                 torch.compile(
                     layer.forward,
                     fullgraph=True,
-                    dynamic=False,
+                    dynamic=True,
                     options={"emulate_precision_casts": True},
                 )
                 if enable_torch_compile
@@ -585,7 +585,7 @@ class PwmWamTransformer(nn.Module):
                 torch.compile(
                     layer.prefill_und,
                     fullgraph=True,
-                    dynamic=False,
+                    dynamic=True,
                     options={"emulate_precision_casts": True},
                 )
                 if enable_torch_compile
@@ -607,7 +607,7 @@ class PwmWamTransformer(nn.Module):
         return PwmAttentionMetadata(lengths, cumulative, joint)
 
     def _compile_context(self):
-        # Static shapes need separate graphs for CFG lengths and cache branches.
+        # Length-one dimensions and metadata aliases can need distinct graphs.
         # Keep capacity bounded and restore the caller's global settings on exit.
         return (
             torch._dynamo.config.patch(
@@ -743,12 +743,26 @@ class PwmWamTransformer(nn.Module):
             raise ValueError("PWM UND cache must contain one KV pair per layer")
         with self._compile_context():
             for index, layer in enumerate(stack.layers):
+                kv = None if und_cache is None else und_cache.layers[index]
+                if layer._compiled_forward is not None and kv is None:
+                    # Use the identical UND graph and materialized KV boundary
+                    # with caching on or off. Compiling the full three-tower
+                    # graph instead permits different rounding/fusion for UND
+                    # intermediates than standalone prefill, even with precision
+                    # casts enabled. Generation still reads pre-update raw KV.
+                    cu_und = (
+                        None
+                        if attention_metadata is None
+                        else attention_metadata.cu_seqlens[0]
+                    )
+                    und, kv = layer._compiled_prefill(streams[0], rope[0], cu_und)
+                    streams = (und, streams[1], streams[2])
                 forward = layer._compiled_forward or layer
                 streams = forward(
                     streams,
                     rope,
                     action_rope,
-                    None if und_cache is None else und_cache.layers[index],
+                    kv,
                     attention_metadata,
                 )
         return (
