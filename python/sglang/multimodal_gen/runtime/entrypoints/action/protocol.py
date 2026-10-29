@@ -15,8 +15,14 @@ import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_pwm_wam import (
+    CosmosPWMWAMPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.cosmos_pwm_wam import (
+    CosmosPWMWAMSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.action.cosmos3 import (
     build_cosmos3_action_sampling_params,
@@ -454,6 +460,12 @@ def build_action_sampling_params(
     server_args: ServerArgs,
 ) -> SamplingParams | ActionSamplingParams:
     sampling_params_cls = _resolve_action_sampling_params_cls(server_args)
+    if issubclass(sampling_params_cls, CosmosPWMWAMSamplingParams):
+        from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
+            build_pwm_wam_action_sampling_params,
+        )
+
+        return build_pwm_wam_action_sampling_params(payload, server_args)
     if issubclass(sampling_params_cls, ActionSamplingParams):
         return _build_action_model_sampling_params(
             payload,
@@ -561,6 +573,18 @@ def action_generation_response(
         response["cache"] = output["cache"]
     if "parallel" in output:
         response["parallel"] = output["parallel"]
+    if isinstance(server_args.pipeline_config, CosmosPWMWAMPipelineConfig):
+        from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
+            pwm_wam_response_metadata,
+        )
+
+        response["data"][0]["action128"] = pwm_wam_response_metadata(
+            output, preserve_numpy=preserve_numpy
+        )
+        if "parameters" in output:
+            response["parameters"] = output["parameters"]
+        if output.get("video") is not None:
+            response["data"][0]["video"] = output["video"]
     return response
 
 
@@ -570,6 +594,12 @@ def action_raw_response(
     preserve_numpy: bool = False,
 ) -> dict[str, Any]:
     response = dict(output)
+    if output.get("action_mode") == "wam" and not preserve_numpy:
+        from sglang.multimodal_gen.runtime.entrypoints.action.cosmos_pwm_wam import (
+            numpy_to_lists,
+        )
+
+        return numpy_to_lists(response)
     actions = response.get("actions")
     if isinstance(actions, np.ndarray) and not preserve_numpy:
         response["actions"] = actions.tolist()
