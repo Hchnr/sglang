@@ -170,7 +170,7 @@ class TestPwmModelContracts(CustomTestCase):
 
     @torch.inference_mode()
     def test_compiled_layers_preserve_cfg_cache_and_checkpoint_state(self):
-        """Static graphs must specialize on both CFG lengths and optional UND KV."""
+        """Compiled CFG branches must preserve cached results and checkpoint tensors."""
         torch._dynamo.reset()
         self.addCleanup(torch._dynamo.reset)
         torch.manual_seed(1214)
@@ -179,7 +179,7 @@ class TestPwmModelContracts(CustomTestCase):
         saved = {name: value.clone() for name, value in model.state_dict().items()}
         graphs = []
 
-        def record_graph(graph, inputs):
+        def record_graph(graph, inputs, **options):
             graphs.append(graph)
             return graph.forward
 
@@ -200,9 +200,12 @@ class TestPwmModelContracts(CustomTestCase):
             rope = tuple((x.cos().bfloat16(), x.sin().bfloat16()) for x in phases)
             before = len(graphs)
             cache = model.build_und_cache(ids, rope[0])
-            self.assertGreater(len(graphs), before, "UND prefill bypassed compilation")
+            if not branches:
+                self.assertGreater(
+                    len(graphs), before, "UND prefill bypassed compilation"
+                )
             branches.append((streams, rope, cache))
-        traced_variants = set()
+        denoising_traced = False
         for index in (0, 1, 0):
             streams, rope, cache = branches[index]
             expected = oracle.forward_hidden(streams, rope, rope)
@@ -211,11 +214,11 @@ class TestPwmModelContracts(CustomTestCase):
                 actual = model.forward_hidden(
                     streams, rope, rope, und_cache=cache if reuse else None
                 )
-                if (index, reuse) not in traced_variants:
+                if not denoising_traced:
                     self.assertGreater(
                         len(graphs), before, "Denoising layer bypassed compilation"
                     )
-                    traced_variants.add((index, reuse))
+                    denoising_traced = True
                 for observed, reference in zip(actual, expected):
                     torch.testing.assert_close(observed, reference, atol=0, rtol=0)
         self.assertEqual(tuple(model.state_dict()), tuple(saved))
@@ -229,6 +232,58 @@ class TestPwmModelContracts(CustomTestCase):
             oracle.forward_hidden(streams, rope, rope),
         ):
             torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+
+    @torch.inference_mode()
+    def test_compiled_requests_reuse_graphs_and_release_conditioning(self):
+        """Varied captions must not exhaust guards or leave request KV in graphs."""
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        torch.manual_seed(1214)
+        model = self.tiny_hidden_model(torch.bfloat16)
+        oracle = copy.deepcopy(model)
+        graphs = []
+
+        def record_graph(graph, inputs, **options):
+            graphs.append(graph)
+            return graph.forward
+
+        with patch("torch.compile", partial(torch.compile, backend=record_graph)):
+            model.configure_inference(enable_torch_compile=True)
+
+        def serve_requests():
+            references = []
+            # More distinct captions than Dynamo's static-graph budget, then
+            # revisit A to catch a stale cache from the final differing request.
+            for text_length in [*range(2, 68), 2]:
+                ids = torch.arange(text_length) % 31 + 1
+                streams = (
+                    model.language_model.model.embed_tokens(ids),
+                    torch.randn(4, 16, dtype=torch.bfloat16),
+                    torch.randn(3, 8, dtype=torch.bfloat16),
+                )
+                rope = tuple(
+                    (torch.ones(n, 8).bfloat16(), torch.zeros(n, 8).bfloat16())
+                    for n in (text_length, 4, 3)
+                )
+                cache = model.build_und_cache(ids, rope[0])
+                references.extend(
+                    weakref.ref(tensor) for pair in cache.layers for tensor in pair
+                )
+                references.append(weakref.ref(cache.hidden))
+                expected = oracle.forward_hidden(streams, rope, rope)
+                for reuse in (False, True):
+                    actual = model.forward_hidden(
+                        streams, rope, rope, und_cache=cache if reuse else None
+                    )
+                    for observed, reference in zip(actual, expected):
+                        torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+            return references
+
+        references = serve_requests()
+        gc.collect()
+        self.assertGreater(len(graphs), 0, "Requests bypassed compilation")
+        self.assertLess(len(graphs), 66, "Compiled graphs grew with every caption")
+        self.assertTrue(all(reference() is None for reference in references))
 
     @torch.inference_mode()
     def test_flash3_metadata_stays_with_its_cfg_branch(self):
@@ -313,7 +368,7 @@ class TestPwmModelContracts(CustomTestCase):
             torch._dynamo.config.accumulated_recompile_limit,
         )
 
-        def fail_compile(graph, inputs):
+        def fail_compile(graph, inputs, **options):
             raise RuntimeError("intentional compiler failure")
 
         with patch("torch.compile", partial(torch.compile, backend=fail_compile)):
