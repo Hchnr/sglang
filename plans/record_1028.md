@@ -28,6 +28,15 @@
 
 阶段验证：目标 S2.14/H100 已实际调用 SGL FA3，输出有限。serving 单测 15 passed +43 subtests，runtime 单测 17 passed +22 subtests；首次 serving 冷导入耗时 277.71 s，不是推理性能。Ruff 选定规则、format、isort 与 diff 检查通过。FA3 整层 GPU 编译及全模型性能仍在进行，尚未宣称达标。
 
+### 决策 D14：以全模型输出决定编译边界
+
+- 组件首次第二 shape 的 cache on/off 出现舍入差异，固定 `emulate_precision_casts=True` 后小组件通过；失败日志保留在 `artifacts/pwm_wam_1029/component_fa3/check_layers_default_precision.*`。
+- 全模型预备运行（非正式性能验收）随后仍发现静态编译的 cache on/off 动作 relative L2=0.008012、max_abs=0.028799，手工 harness 如期中止，没有把失败轮当成通过。首个 off 总耗时 2.066831 s、on 2.000552 s，仅用于定位；不能据此宣称输出验收或最终性能收益。证据 `preliminary_compile_cache_compare/`。
+- 改为编译路径 cache on/off 共用相同的 UND prefill 与 VIDEO/ACTION generation 编译函数。未缓存时每层重新计算 UND，缓存时跨采样步复用同样的结果；eager SDPA oracle 保留原计算路径。启用动态序列长度，避免不同 caption 长度耗尽静态图上限。新边界组件覆盖两 shape/CFG/A→B→A 与连续68种长度，三塔 cache 开关 exact；还需全模型复核。
+- 独立 CPU 审查：36层复用图，没有每层放大；动态候选66种caption长度+回访仅3图，469个request tensor弱引用全部释放。旧静态候选64种变体后会明确报错，未采用无限加大上限或静默退回 eager。
+- 第一次全模型预备运行仅加载后失败：原 `/share/project/eai_pwm/models/...` 已迁移至 `/share-mixed/project/eai_pwm/models/...`。未更换资产内容；重试使用已存在路径。runtime 增加本地 VAE/tokenizer 配置文件预检，避免缺少路径时先加载32GB模型。
+- 当前 Cosmos 在 S 的同一 Torch2.14/Transformers5 环境已真实完成 FA3+compile 短请求。只为未使用的Edge processor旧导入位置恢复 `get_image_size` re-export；记录adapter函数/文件SHA，不改模型/采样数学或外部checkout。正式大请求同环境ABBA对照继续进行。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。

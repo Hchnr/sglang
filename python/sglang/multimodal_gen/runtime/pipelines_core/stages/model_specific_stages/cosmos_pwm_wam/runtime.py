@@ -102,6 +102,18 @@ class PwmWamRuntime(nn.Module):
         self.enable_und_cache = enable_und_cache
         self.attention_backend = attention_backend
         self.enable_torch_compile = enable_torch_compile
+        # Reject missing local assets before loading the 32 GB transformer.
+        vae_root = Path(vae_path).expanduser().resolve()
+        tokenizer_root = Path(tokenizer_path).expanduser().resolve()
+        for path in (
+            vae_root / "config.json",
+            tokenizer_root / "tokenizer_config.json",
+        ):
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Required PWM WAM local asset is missing: {path}"
+                )
+        vae_path, tokenizer_path = str(vae_root), str(tokenizer_root)
         from diffusers import AutoencoderKLWan
         from transformers import AutoTokenizer
 
