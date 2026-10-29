@@ -1,5 +1,7 @@
 # 三塔 PWM WAM 接入 SGLang：结论
 
+> 2026-10-29 性能验收重新打开：用户明确接入应比开启 compile + FlashAttention 3 的 Cosmos Baseline 更快。下文 10/28 的“完成”只代表功能与当时的局部优化，不能代表整体性能目标完成。现有稳定态 2.233 s（Cosmos）与 3.154 s（SGLang/cache）仍有约 41% 差距；正在补齐原生 FA3/compile，并建立同软件环境、同 GPU、同输入和计时边界的对照。新的结果验证前不宣称达标。
+
 已完成本轮单GPU/B1范围的原生WAM接入、正确性验证和两项保守优化。同环境Cosmos-vs-native六场景的动作及视频逐位一致，目标环境的缓存开关/三入口互比也逐位一致。UND缓存相对未缓存路径实测延迟下降 **3.15%**（原尺寸无视频decode）和 **13.14%**（带视频短请求），GPU模型权重减少 **1.159 GiB**。最终审查发现的Python参数静默忽略问题已修复并经真实worker验证；所有本任务服务和worker均已退出。
 
 原生接入与功能验证已完成：真实 checkpoint 由 SGLang worker 直接执行 UND、VIDEO、ACTION 三塔及联合 UniPC，Python、原生 action HTTP 和 Cosmos `/generate` 兼容入口均可交付动作及可选视频。
