@@ -3,14 +3,15 @@
 # Adapted from vllm-omni-pwm d3e9aad33e861b69be16c4f341695e1cc12b3314.
 """Native BF16 PWM three-tower model with the original HF parameter tree.
 
-Inference is single-sample SDPA. Model state contains weights only; request-owned
-noise, solver history and conditioning are supplied by the pipeline.
+Inference is single-sample SDPA or FlashAttention 3, with optional layer compile.
+Noise, solver history and conditioning remain owned by individual requests.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import NamedTuple
 
@@ -22,6 +23,14 @@ from torch import Tensor, nn
 Rope = tuple[Tensor, Tensor]
 Streams = tuple[Tensor, Tensor, Tensor]
 UndKV = tuple[Tensor, Tensor]
+
+
+class PwmAttentionMetadata(NamedTuple):
+    """One unpadded sample's FA3 boundaries, reusable within its CFG branch."""
+
+    lengths: tuple[int, int, int]
+    cu_seqlens: tuple[Tensor, Tensor, Tensor]
+    cu_joint: Tensor
 
 
 class PwmUndCache(NamedTuple):
@@ -72,7 +81,14 @@ def rotate(x: Tensor, rope: Rope) -> Tensor:
     return x * rope[0][:, None] + torch.cat((-right, left), dim=-1) * rope[1][:, None]
 
 
-def attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool = False) -> Tensor:
+def attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    causal: bool = False,
+    cu_seqlens: tuple[Tensor, Tensor] | None = None,
+) -> Tensor:
     mask = torch.ones((q.shape[0], k.shape[0]), dtype=torch.bool, device=q.device)
     if causal:
         mask = mask.tril()
@@ -171,13 +187,25 @@ class PwmThreeTowerLayer(nn.Module):
         self.action_block_moe_gen_action = PwmActionBlock(
             action_width, action_intermediate, heads=heads, kv_heads=kv_heads, dim=dim
         )
+        self.attention_backend = "sdpa"
+        self._attention = attention
+        self._compiled_forward = None
+        self._compiled_prefill = None
 
-    def prefill_und(self, und: Tensor, rope: Rope) -> tuple[Tensor, UndKV]:
+    def prefill_und(
+        self, und: Tensor, rope: Rope, cu_und: Tensor | None = None
+    ) -> tuple[Tensor, UndKV]:
         """Compute the causal UND stream, which cannot read either noisy tower."""
         attn = self.self_attn
         qu, raw_ku, vu = attn.project(self.input_layernorm(und), normalize_key=False)
         ku = attn.k_norm(raw_ku)
-        yu = attention(rotate(qu, rope), rotate(ku, rope), vu, causal=True)
+        yu = self._attention(
+            rotate(qu, rope),
+            rotate(ku, rope),
+            vu,
+            causal=True,
+            cu_seqlens=None if cu_und is None else (cu_und, cu_und),
+        )
         und = und + attn.o_proj(yu)
         und = und + self.mlp(self.post_attention_layernorm(und))
         return und, (raw_ku, vu)
@@ -188,6 +216,7 @@ class PwmThreeTowerLayer(nn.Module):
         rope: tuple[Rope, Rope, Rope],
         action_rope: tuple[Rope, Rope, Rope],
         und_cache: UndKV | None = None,
+        attention_metadata: PwmAttentionMetadata | None = None,
     ) -> Streams:
         und, video, action = streams
         attn, act = self.self_attn, self.action_block_moe_gen_action
@@ -202,17 +231,33 @@ class PwmThreeTowerLayer(nn.Module):
         qv, kv, vv = attn.project(self.input_layernorm_moe_gen(video), "_moe_gen")
         qa, ka, va = act.project(act.input_layernorm(action))
         keys, values = (ku, kv, ka), (vu, vv, va)
+        all_values = torch.cat(values)
+        if attention_metadata is None:
+            cu_und = cu_video = cu_action = None
+        else:
+            cu_u, cu_v, cu_a = attention_metadata.cu_seqlens
+            cu_und = (cu_u, cu_u)
+            cu_video = (cu_v, attention_metadata.cu_joint)
+            cu_action = (cu_a, attention_metadata.cu_joint)
         if und_cache is None:
-            yu = attention(rotate(qu, rope[0]), rotate(ku, rope[0]), vu, causal=True)
-        yv = attention(
+            yu = self._attention(
+                rotate(qu, rope[0]),
+                rotate(ku, rope[0]),
+                vu,
+                causal=True,
+                cu_seqlens=cu_und,
+            )
+        yv = self._attention(
             rotate(qv, rope[1]),
             torch.cat([rotate(k, r) for k, r in zip(keys, rope)]),
-            torch.cat(values),
+            all_values,
+            cu_seqlens=cu_video,
         )
-        ya = attention(
+        ya = self._attention(
             rotate(qa, action_rope[2]),
             torch.cat([rotate(k, r) for k, r in zip(keys, action_rope)]),
-            torch.cat(values),
+            all_values,
+            cu_seqlens=cu_action,
         )
         action = action + act.o_proj(ya)
         action = action + act.mlp(act.post_attention_layernorm(action))
@@ -493,6 +538,85 @@ class PwmWamTransformer(nn.Module):
         }
         return model.eval()
 
+    @property
+    def attention_backend(self) -> str:
+        return self.language_model.model.layers[0].attention_backend
+
+    @property
+    def enable_torch_compile(self) -> bool:
+        return self.language_model.model.layers[0]._compiled_forward is not None
+
+    def configure_inference(
+        self, *, attention_backend: str = "sdpa", enable_torch_compile: bool = False
+    ) -> None:
+        """Select execution once at startup without changing checkpoint keys.
+
+        Compiled callables specialize on each request shape and cache branch.
+        They retain weights and executable graphs, never request tensors/KV.
+        Compilation failures propagate rather than silently executing eagerly.
+        """
+        if attention_backend not in ("sdpa", "flash3"):
+            raise ValueError("PWM attention_backend must be 'sdpa' or 'flash3'")
+        if type(enable_torch_compile) is not bool:
+            raise ValueError("PWM enable_torch_compile must be a boolean")
+        attend = attention
+        if attention_backend == "flash3":
+            from .execution import flash3_attention, validate_flash3
+
+            weight = self.language_model.model.embed_tokens.weight
+            validate_flash3(weight.device, weight.dtype)
+            attend = flash3_attention
+        for layer in self.language_model.model.layers:
+            layer.attention_backend = attention_backend
+            layer._attention = attend
+            # Preserve BF16 operator boundaries across prefill and generation.
+            # Eliding casts makes cached KV and same-graph UND round differently.
+            layer._compiled_forward = (
+                torch.compile(
+                    layer.forward,
+                    fullgraph=True,
+                    dynamic=False,
+                    options={"emulate_precision_casts": True},
+                )
+                if enable_torch_compile
+                else None
+            )
+            layer._compiled_prefill = (
+                torch.compile(
+                    layer.prefill_und,
+                    fullgraph=True,
+                    dynamic=False,
+                    options={"emulate_precision_casts": True},
+                )
+                if enable_torch_compile
+                else None
+            )
+
+    def build_attention_metadata(
+        self, lengths: tuple[int, int, int], *, device: torch.device
+    ) -> PwmAttentionMetadata | None:
+        """Build once per request/CFG branch; SDPA requires no metadata."""
+        if self.attention_backend == "sdpa":
+            return None
+        if len(lengths) != 3 or any(n <= 0 for n in lengths):
+            raise ValueError("PWM attention requires three nonempty tower lengths")
+        cumulative = tuple(
+            torch.tensor([0, n], dtype=torch.int32, device=device) for n in lengths
+        )
+        joint = torch.tensor([0, sum(lengths)], dtype=torch.int32, device=device)
+        return PwmAttentionMetadata(lengths, cumulative, joint)
+
+    def _compile_context(self):
+        # Static shapes need separate graphs for CFG lengths and cache branches.
+        # Keep capacity bounded and restore the caller's global settings on exit.
+        return (
+            torch._dynamo.config.patch(
+                recompile_limit=64, accumulated_recompile_limit=512
+            )
+            if self.enable_torch_compile
+            else nullcontext()
+        )
+
     def encode_inputs(
         self,
         text_ids: Tensor,
@@ -558,7 +682,13 @@ class PwmWamTransformer(nn.Module):
         return velocity, mask_actions(action, action_dim_mask)
 
     @torch.no_grad()
-    def build_und_cache(self, text_ids: Tensor, rope: Rope) -> PwmUndCache:
+    def build_und_cache(
+        self,
+        text_ids: Tensor,
+        rope: Rope,
+        *,
+        attention_metadata: PwmAttentionMetadata | None = None,
+    ) -> PwmUndCache:
         """Prefill one branch without retaining any request state on the model.
 
         Build and consume under the same precision/attention context. The caller
@@ -566,10 +696,26 @@ class PwmWamTransformer(nn.Module):
         """
         stack = self.language_model.model
         und = stack.embed_tokens(text_ids)
+        cu_und = None
+        if self.attention_backend == "flash3":
+            if attention_metadata is None:
+                cu_und = torch.tensor(
+                    [0, len(text_ids)], dtype=torch.int32, device=text_ids.device
+                )
+            else:
+                if attention_metadata.lengths[0] != len(text_ids):
+                    raise ValueError(
+                        "PWM UND metadata length differs from conditioning"
+                    )
+                cu_und = attention_metadata.cu_seqlens[0]
+        elif attention_metadata is not None:
+            raise ValueError("PWM SDPA does not accept FA3 attention metadata")
         layers = []
-        for layer in stack.layers:
-            und, kv = layer.prefill_und(und, rope)
-            layers.append(kv)
+        with self._compile_context():
+            for layer in stack.layers:
+                prefill = layer._compiled_prefill or layer.prefill_und
+                und, kv = prefill(und, rope, cu_und)
+                layers.append(kv)
         return PwmUndCache(tuple(layers), und)
 
     def forward_hidden(
@@ -578,22 +724,33 @@ class PwmWamTransformer(nn.Module):
         rope: tuple[Rope, Rope, Rope],
         action_rope: tuple[Rope, Rope, Rope],
         und_cache: PwmUndCache | None = None,
-        attention_metadata=None,
+        attention_metadata: PwmAttentionMetadata | None = None,
     ) -> Streams:
-        if attention_metadata is not None:
-            raise ValueError(
-                "PWM eager SDPA does not support packed attention metadata"
-            )
+        if self.attention_backend == "flash3":
+            lengths = tuple(len(stream) for stream in streams)
+            if attention_metadata is None:
+                attention_metadata = self.build_attention_metadata(
+                    lengths, device=streams[0].device
+                )
+            elif attention_metadata.lengths != lengths:
+                raise ValueError(
+                    "PWM attention metadata lengths differ from the request"
+                )
+        elif attention_metadata is not None:
+            raise ValueError("PWM SDPA does not accept FA3 attention metadata")
         stack = self.language_model.model
         if und_cache is not None and len(und_cache.layers) != len(stack.layers):
             raise ValueError("PWM UND cache must contain one KV pair per layer")
-        for index, layer in enumerate(stack.layers):
-            streams = layer(
-                streams,
-                rope,
-                action_rope,
-                None if und_cache is None else und_cache.layers[index],
-            )
+        with self._compile_context():
+            for index, layer in enumerate(stack.layers):
+                forward = layer._compiled_forward or layer
+                streams = forward(
+                    streams,
+                    rope,
+                    action_rope,
+                    None if und_cache is None else und_cache.layers[index],
+                    attention_metadata,
+                )
         return (
             stack.norm(streams[0] if und_cache is None else und_cache.hidden),
             stack.norm_moe_gen(streams[1]),
