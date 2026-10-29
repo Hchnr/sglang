@@ -54,6 +54,14 @@
 - 整体验收保持未完成，继续GPU0区分native FA3 eager、SDPA eager和编译路径的DROID输出，研究确定性归约等保守数值策略。已通过速度测量不替代此质量工作；所有失败和早期策略样本继续保留。
 - CPU新模型13、runtime17、serving15合计45项；原有Cosmos3/Pi05/registry回归163 passed +59 subtests。IEEE作用域新增断言已用旧forward实际红灯/当前绿灯验证，证据 `ieee_review/`。
 
+### 决策 D17：隔离编译归约与激活，不降低质量门槛
+
+- DROID同环境最小诊断已排除媒体/VAE/FA3移植语义问题：native FA3 eager与Cosmos FA3 eager的33帧视频逐像素exact；active physical仅1个值差1.164153218e-10，normalized差7.450580597e-9。重复请求exact。native SDPA eager相对Cosmos FA3 eager也逐帧通过原门槛（最差0.934650/25.1064dB），但不是bitwise。证据 `quality_droid_eager_diagnosis/`。
+- `deterministic=True` 和再加 `numerics='strict'` 两个显式编译诊断均失败：最差SSIM0.913014、PSNR21.7381dB。选项真实生效且repeat exact，但不能作为修复。未修改生产配置来伪称通过。
+- 仅在诊断进程为RMSNorm的原始 `Tensor.mean(-1, keepdim=True)` 加ATen custom-op编译边界，保持所有其余表达式不变，DROID全部33帧通过：最差SSIM0.979479、PSNR32.2117dB；动作仍有relL2约0.023，未宣称精确。证据 `quality_droid_aten_mean/`。下一步单独验证原F.silu的编译边界及主尺寸性能，候选未验收前不改生产。
+- 证实不同编译历史的generation图源码归一化后相同，但归约autotune R0_BLOCK2048/4096不同，方差求和的浮点次序可不同。该证据不等于所有漂移已证明源自此kernel，也未见请求Tensor泄漏证据。完整缓存/行号见 `compile_autotune_diagnosis.{md,json}`。
+- 实际优化服务验证完成：native HTTP与Cosmos facade各4次off/on/on/off，共8请求的动作/normalized与视频均exact；实际worker为FA3+compile、两个FP32 TF32开关False。视频下载、删除/404、native400与facade422错误后恢复正常，两服务优雅退出、GPU1清空、输出store清理，证据 `serving_ieee/`。其数学路径为当前2f499实现，不能据此宣称后续新编译算子已通过同样验证。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。
