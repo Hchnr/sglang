@@ -113,6 +113,13 @@
 - “基本打平”预先采用稳定态中位延迟差不超过5%的工程观察口径，并检查独立进程波动；不等于统计等价证明。V只在最终输出屏蔽inactive槽位，当前S/Cosmos在采样中持续屏蔽，故相同外部JSON不代表相同数学。必须同时披露正确性/语义差异，不通过省略mask或改变用户输入让性能数字变好。
 - 当前V环境Torch2.13/Diffusers0.40/Transformers5.14，S为2.14/0.37/5.19。先尝试V原始runtime在S环境导入/运行；若只能leaf隔离或使用其公开`flash3_nv`替代bundledFA3，要明确标记诊断范围/实际provider。当前比较尚未完成，未宣称持平。
 
+### 决策 D24：使用真实 vLLM 包和 bundled FA3，不替换数学
+
+- 已在S Torch2.14.1环境、合法GPU0，通过实际V package导入并执行公开`pwm_fa3_attention`，bundled `flash3`及`flash3_nv`均输出有限，实际加载`_vllm_fa3_C.abi3.so`。正式采用原生bundled FA3，不需要namespace隔离或provider替换，证据 `vllm_comparison/actual_fa3_probe.{json,log}`。
+- 先前两个无GPU导入probe均在无关ModelOpt/FP8的NVML capability检查失败，原因是`CUDA_VISIBLE_DEVICES=9`在vLLM被当成physical NVML index9，而非WAM依赖缺失或Torch ABI错误。合法GPU的实际执行已排除此阻塞。冷NFS扫描Transformers配置耗时计入import，不算推理耗时。
+- 正式GPU2原样V/S/S/V已启动，固定同一主请求、S软件栈、两端FA3+compile+请求内UND、deterministic=False及有效TF32=False。外层同步raw→CPU动作，V自身CPU list构造成本保留在其调用内，测后仅统一字段保存；并行GPU0独立对照V主尺寸视频/动作与既有S/Cosmos eager输出。尚未以相同JSON推断质量等价。
+- 独立源码/历史审计保存 `vllm_native_source_audit.json`。V历史gate-up仅约0.143%收益、QKV反慢且有数值差异、graph收益未证实，因此主对照不叠实验项；FP8/近似缓存不作为同精度比较。V单卡engine是inline UniProc，S Python worker含IPC，runtime比较不冒充完整部署入口比较。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。
