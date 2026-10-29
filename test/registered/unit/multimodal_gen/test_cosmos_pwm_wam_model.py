@@ -7,7 +7,9 @@ import json
 import tempfile
 import unittest
 import weakref
+from functools import partial
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
@@ -26,6 +28,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.transformer import
     PwmThreeTowerLayer,
     PwmTimeEmbedding,
     PwmWamTransformer,
+    attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.vae import (
     preserve_checkpoint_rms,
@@ -164,6 +167,170 @@ class TestPwmModelContracts(CustomTestCase):
         gc.collect()
         self.assertTrue(all(reference() is None for reference in references))
         self.assertEqual(tuple(model.state_dict()), state_keys)
+
+    @torch.inference_mode()
+    def test_compiled_layers_preserve_cfg_cache_and_checkpoint_state(self):
+        """Static graphs must specialize on both CFG lengths and optional UND KV."""
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        torch.manual_seed(1214)
+        model = self.tiny_hidden_model(torch.bfloat16)
+        oracle = copy.deepcopy(model)
+        saved = {name: value.clone() for name, value in model.state_dict().items()}
+        graphs = []
+
+        def record_graph(graph, inputs):
+            graphs.append(graph)
+            return graph.forward
+
+        # Exercise Dynamo's real fullgraph tracing on CPU; GPU Inductor/kernel
+        # numerical parity is covered by explicit-asset validation separately.
+        with patch("torch.compile", partial(torch.compile, backend=record_graph)):
+            model.configure_inference(enable_torch_compile=True)
+        self.assertTrue(model.enable_torch_compile)
+        branches = []
+        for lengths in ((5, 4, 2), (2, 6, 3)):
+            ids = torch.arange(lengths[0]) + 1
+            streams = (
+                model.language_model.model.embed_tokens(ids),
+                torch.randn(lengths[1], 16, dtype=torch.bfloat16),
+                torch.randn(lengths[2], 8, dtype=torch.bfloat16),
+            )
+            phases = [torch.randn(length, 4).repeat(1, 2) for length in lengths]
+            rope = tuple((x.cos().bfloat16(), x.sin().bfloat16()) for x in phases)
+            before = len(graphs)
+            cache = model.build_und_cache(ids, rope[0])
+            self.assertGreater(len(graphs), before, "UND prefill bypassed compilation")
+            branches.append((streams, rope, cache))
+        traced_variants = set()
+        for index in (0, 1, 0):
+            streams, rope, cache = branches[index]
+            expected = oracle.forward_hidden(streams, rope, rope)
+            for reuse in (False, True):
+                before = len(graphs)
+                actual = model.forward_hidden(
+                    streams, rope, rope, und_cache=cache if reuse else None
+                )
+                if (index, reuse) not in traced_variants:
+                    self.assertGreater(
+                        len(graphs), before, "Denoising layer bypassed compilation"
+                    )
+                    traced_variants.add((index, reuse))
+                for observed, reference in zip(actual, expected):
+                    torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+        self.assertEqual(tuple(model.state_dict()), tuple(saved))
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, saved[name], atol=0, rtol=0)
+        model.configure_inference(enable_torch_compile=False)
+        self.assertFalse(model.enable_torch_compile)
+        streams, rope, _ = branches[0]
+        for observed, reference in zip(
+            model.forward_hidden(streams, rope, rope),
+            oracle.forward_hidden(streams, rope, rope),
+        ):
+            torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+
+    @torch.inference_mode()
+    def test_flash3_metadata_stays_with_its_cfg_branch(self):
+        """UND is causal; both generation towers attend the joint unpadded KV."""
+        from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam import execution
+
+        torch.manual_seed(1214)
+        model = self.tiny_hidden_model(torch.bfloat16)
+        oracle = copy.deepcopy(model)
+
+        def cpu_kernel(q, k, v, cu_q, cu_k, causal):
+            # Mock only the GPU kernel boundary. Reject an incorrect varlen
+            # description before computing the reference attention on CPU.
+            self.assertEqual(cu_q.dtype, torch.int32)
+            self.assertEqual(cu_k.dtype, torch.int32)
+            self.assertEqual(cu_q.tolist(), [0, q.shape[0]])
+            self.assertEqual(cu_k.tolist(), [0, k.shape[0]])
+            return attention(q, k, v, causal=causal).reshape(q.shape)
+
+        with (
+            patch.object(execution, "validate_flash3"),
+            patch.object(execution, "_flash3", side_effect=cpu_kernel),
+        ):
+            model.configure_inference(attention_backend="flash3")
+            branches = []
+            for lengths in ((5, 4, 2), (2, 6, 3)):
+                ids = torch.arange(lengths[0]) + 1
+                streams = (
+                    model.language_model.model.embed_tokens(ids),
+                    torch.randn(lengths[1], 16, dtype=torch.bfloat16),
+                    torch.randn(lengths[2], 8, dtype=torch.bfloat16),
+                )
+                rope = tuple(
+                    (torch.ones(n, 8).bfloat16(), torch.zeros(n, 8).bfloat16())
+                    for n in lengths
+                )
+                metadata = model.build_attention_metadata(lengths, device="cpu")
+                branches.append((ids, streams, rope, metadata))
+            for index in (0, 1, 0):
+                ids, streams, rope, metadata = branches[index]
+                expected = oracle.forward_hidden(streams, rope, rope)
+                cache = model.build_und_cache(ids, rope[0], attention_metadata=metadata)
+                for reuse in (False, True):
+                    actual = model.forward_hidden(
+                        streams,
+                        rope,
+                        rope,
+                        und_cache=cache if reuse else None,
+                        attention_metadata=metadata,
+                    )
+                    for observed, reference in zip(actual, expected):
+                        torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+            ids, streams, rope, metadata = branches[0]
+            other = branches[1][-1]
+            with self.assertRaisesRegex(ValueError, "length"):
+                model.forward_hidden(streams, rope, rope, attention_metadata=other)
+            with self.assertRaisesRegex(ValueError, "length"):
+                model.build_und_cache(ids, rope[0], attention_metadata=other)
+            with self.assertRaisesRegex(ValueError, "SDPA"):
+                oracle.forward_hidden(streams, rope, rope, attention_metadata=metadata)
+
+    @torch.inference_mode()
+    def test_execution_errors_do_not_silently_select_another_backend(self):
+        """Rejected policies and compiler errors must not report successful eager fallback."""
+        model = self.tiny_hidden_model(torch.bfloat16)
+        for settings, message in (
+            ({"attention_backend": "auto"}, "attention_backend"),
+            ({"enable_torch_compile": "false"}, "boolean"),
+            ({"attention_backend": "flash3"}, "CUDA BF16"),
+        ):
+            with (
+                self.subTest(settings=settings),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                model.configure_inference(**settings)
+            self.assertEqual(model.attention_backend, "sdpa")
+            self.assertFalse(model.enable_torch_compile)
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        limits = (
+            torch._dynamo.config.recompile_limit,
+            torch._dynamo.config.accumulated_recompile_limit,
+        )
+
+        def fail_compile(graph, inputs):
+            raise RuntimeError("intentional compiler failure")
+
+        with patch("torch.compile", partial(torch.compile, backend=fail_compile)):
+            model.configure_inference(enable_torch_compile=True)
+        ids = torch.tensor([1, 2, 3])
+        rope = (torch.ones(3, 8).bfloat16(), torch.zeros(3, 8).bfloat16())
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.BackendCompilerFailed, "intentional compiler failure"
+        ):
+            model.build_und_cache(ids, rope)
+        self.assertEqual(
+            (
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.accumulated_recompile_limit,
+            ),
+            limits,
+        )
 
     @torch.inference_mode()
     def test_three_tower_visibility_and_causal_und(self):
