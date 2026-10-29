@@ -433,23 +433,37 @@ class PwmWamRuntime(nn.Module):
                 ),
                 "attention_backend": getattr(self, "attention_backend", "sdpa"),
                 "enable_torch_compile": getattr(self, "enable_torch_compile", False),
+                "fp32_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+                "fp32_cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
             },
         }
 
     @torch.inference_mode()
     def forward(self, raw: dict) -> dict[str, Any]:
-        # The shared SGLang platform disables cuDNN SDPA for other pipelines.
-        # This checkpoint was validated with PyTorch's full backend selection;
-        # preserve that policy for WAM and restore the caller's flags on exit.
-        with sdpa_kernel(
-            [
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-                SDPBackend.CUDNN_ATTENTION,
-            ]
-        ):
-            return self._forward(raw)
+        # Match Cosmos' FP32 time embeddings and solver policy even when the
+        # shared SGLang platform enables TF32 for other pipelines. Restore all
+        # caller settings, including after failed requests.
+        previous = (
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32,
+        )
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            # SGLang disables cuDNN SDPA globally; WAM's eager reference uses
+            # PyTorch's full backend selection inside this request only.
+            with sdpa_kernel(
+                [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                    SDPBackend.CUDNN_ATTENTION,
+                ]
+            ):
+                return self._forward(raw)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous[0]
+            torch.backends.cudnn.allow_tf32 = previous[1]
 
     def _forward(self, raw: dict) -> dict[str, Any]:
         # Record completed GPU work, including the small

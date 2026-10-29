@@ -255,6 +255,10 @@ FP32 solver、步数、CFG、噪声与完整 VIDEO/ACTION 联合生成合同保�
 FA3 与编译融合可能改变浮点舍入，具体输出误差与性能必须以目标环境验证为准。
 结果 `parameters.attention_backend` 与 `parameters.enable_torch_compile`
 记录实际执行配置。
+WAM 请求内关闭 FP32 matmul/cuDNN 的 TF32，与 Cosmos 的 FP32 时间嵌入策略
+一致，结束或异常后恢复调用方设置；有效策略记录在
+`parameters.fp32_matmul_allow_tf32` / `fp32_cudnn_allow_tf32`。不要用请求外的
+进程全局设置推断模型请求内精度。
 
 兼容 facade 可传 `--attention-backend flash3 --enable-torch-compile
 --enable-und-cache`。手工验证工具支持 `--attention-backend flash3

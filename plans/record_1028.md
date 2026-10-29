@@ -37,6 +37,14 @@
 - 第一次全模型预备运行仅加载后失败：原 `/share/project/eai_pwm/models/...` 已迁移至 `/share-mixed/project/eai_pwm/models/...`。未更换资产内容；重试使用已存在路径。runtime 增加本地 VAE/tokenizer 配置文件预检，避免缺少路径时先加载32GB模型。
 - 当前 Cosmos 在 S 的同一 Torch2.14/Transformers5 环境已真实完成 FA3+compile 短请求。只为未使用的Edge processor旧导入位置恢复 `get_image_size` re-export；记录adapter函数/文件SHA，不改模型/采样数学或外部checkout。正式大请求同环境ABBA对照继续进行。
 
+### 决策 D15：性能对照必须匹配有效 FP32 策略
+
+新动态共享 prefill 的全模型主请求 gate 通过：四次 off/on/on/off 的全部 Action128 和 normalized arrays exact，source SHA 前后一致（`quality_main_cache/`）。同软件环境的首组正式样本随后被独立审查发现有效数值策略差异：Cosmos 的 FP32 matmul/cuDNN TF32=False，SGLang 平台默认=True；时间嵌入确有 FP32 GEMM，不能假设这一差异无影响。
+
+保留 `fair_runtime/block_00` 至 `block_03` 为各自默认 policy 的诊断组，不作为同精度提速验收。原生 runtime 在单请求作用域关闭两项 TF32，正常返回与异常后恢复 caller 设置；response parameters 回显实际作用域内 flags。扩展既有作用域回归，以外部 True→请求内 False→成功/异常恢复 True 验证，不以父进程 caller flags 充当 worker 有效精度。
+
+随后另采有效 IEEE 策略一致的 C/S/S/C，对照 compile+FA3、同软件栈/同输入/同GPU；保留两组全部数据，不删除第一次 cache gate/默认policy benchmark。C 原生配置不改，只有 S 修正其默认数值策略。采样工具在各完整组结束前保持同一SHA，汇总分析再增强有效/外部policy和harness身份检查。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。

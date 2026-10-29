@@ -564,20 +564,38 @@ class TestPwmRuntimeContracts(CustomTestCase):
 
         def encode(request):
             self.assertEqual(flags(), (True, True, True, True))
+            self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+            self.assertFalse(torch.backends.cudnn.allow_tf32)
             return clean
 
-        with sdpa_kernel([SDPBackend.MATH]):
-            previous = flags()
-            with patch.object(runtime, "encode_observation", side_effect=encode):
-                with (
-                    patch.object(runtime, "sample", side_effect=RuntimeError("failed")),
-                    self.assertRaisesRegex(RuntimeError, "failed"),
-                ):
-                    runtime.forward(self.raw)
-                self.assertEqual(flags(), previous)
-                with patch.object(runtime, "_finalize", return_value={}):
-                    result = runtime.forward(self.raw)
-                self.assertEqual(flags(), previous)
+        previous_tf32 = (
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32,
+        )
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            with sdpa_kernel([SDPBackend.MATH]):
+                previous = flags()
+                with patch.object(runtime, "encode_observation", side_effect=encode):
+                    with (
+                        patch.object(
+                            runtime, "sample", side_effect=RuntimeError("failed")
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "failed"),
+                    ):
+                        runtime.forward(self.raw)
+                    self.assertEqual(flags(), previous)
+                    self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                    self.assertTrue(torch.backends.cudnn.allow_tf32)
+                    with patch.object(runtime, "_finalize", return_value={}):
+                        result = runtime.forward(self.raw)
+                    self.assertEqual(flags(), previous)
+                    self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                    self.assertTrue(torch.backends.cudnn.allow_tf32)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32[0]
+            torch.backends.cudnn.allow_tf32 = previous_tf32[1]
         self.assertEqual(
             set(result["timing_seconds"]),
             {"prepare", "vae_encode", "sample", "finalize", "total"},
