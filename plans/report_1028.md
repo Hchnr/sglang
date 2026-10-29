@@ -42,6 +42,14 @@ runtime速度比为1.06952×，平均值C/S分别2.313672/2.163292 s；worker速
 
 最终GPU监督从空闲开始、结束后再次清空。容器无法把NVML的host PID与/proc的namespace PID一一映射；worker采用parent/worker进程树与GPU fd、最多两个CUDA context及稳定GPU PID集合的关联审计。该能力边界和零样本监督误判/全新重跑均在record中说明，未把中止轮计入统计。
 
+## 与本地 vLLM-Omni PWM 的补充对照（10/29）
+
+原样vLLM的输出检查已完成，稳定态V/S/S/V性能序列仍在测量；本节不以此前Cosmos对照数字推断vLLM性能。两端在S目标软件栈执行各自真实native runtime、compile+FA3+请求内UND cache，vLLM使用其实际bundled FA3，没有provider替换或数学补丁。
+
+同一主尺寸带视频请求（原10-active Action128 mask、40 actions/41帧、5 steps/CFG1.5/seed42），vLLM两次完整动作/normalized/video重复exact。对当前S最终输出及同环境Cosmos FA3 eager，active physical relative L2均为 **0.460072202**（max_abs1.253084064），normalized relative L2为 **0.578084861**。视频全部41帧通过既有门槛，最低SSIM **0.946424944**、PSNR **25.810457791dB**，pixel MAE1.777122065；离散合同一致且inactive输出全零。**动作仍有显著差异，视频通过不能作为动作数值等价或机器人业务质量相同的证据。**
+
+源码显示V只在最终输出屏蔽inactive action槽位，S/Cosmos在采样过程中持续屏蔽；编译算术和实际FA3 provider也有差别。这次检查没有分离三者的因果，不能把相同JSON视作相同数学。原始数组、逐帧分数、实际provider/source hash及正常退出证据见 [quality findings](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/findings.md) 和 [comparison.json](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/comparison.json)。
+
 ## 最终质量与状态隔离
 
 正确性锚点为**同环境、同FA3的Cosmos eager**，用于保留原模型逐算子数值语义；性能Baseline继续使用Cosmos compile+FA3。选择该锚点前，已独立验证native FA3 eager与源FA3 eager的DROID视频精确一致，确认移植、VAE和FA3合同，而不是为最终候选临时挑选oracle。

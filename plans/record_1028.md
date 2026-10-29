@@ -120,6 +120,13 @@
 - 正式GPU2原样V/S/S/V已启动，固定同一主请求、S软件栈、两端FA3+compile+请求内UND、deterministic=False及有效TF32=False。外层同步raw→CPU动作，V自身CPU list构造成本保留在其调用内，测后仅统一字段保存；并行GPU0独立对照V主尺寸视频/动作与既有S/Cosmos eager输出。尚未以相同JSON推断质量等价。
 - 独立源码/历史审计保存 `vllm_native_source_audit.json`。V历史gate-up仅约0.143%收益、QKV反慢且有数值差异、graph收益未证实，因此主对照不叠实验项；FP8/近似缓存不作为同精度比较。V单卡engine是inline UniProc，S Python worker含IPC，runtime比较不冒充完整部署入口比较。
 
+### 决策 D25：分别报告 vLLM 原样路径的速度和输出差异
+
+- GPU0使用实际V package、原生bundled FA3、compile+UND cache完成两次主尺寸带视频请求。保留原10-active Action128 mask、5 steps/CFG1.5/seed42，没有替换模型/编译选项/provider或修改外部checkout；S目标Torch2.14.1环境、有效双TF32=False。两次全128动作、normalized及41帧uint8视频逐元素exact，源码及外部tracked diff SHA前后一致，进程exit0后GPU0归零。
+- V对当前S最终主场景及Cosmos FA3 eager的指标相同：active physical relative L2=0.460072202、max_abs=1.253084064、RMSE=0.247408028；normalized relative L2=0.578084861。离散合同相同、inactive输出全零，但不能宣称动作数值等价，也没有机器人闭环成功率证据。
+- 视频41帧均通过原SSIM≥0.92/PSNR≥24dB，最差frame27为0.946424944/25.810457791dB；pixel MAE=1.777122065。视频过门槛不覆盖动作差异；未将差异全部归因于mask、编译或FA3 provider中的单一因素。原始数组、实际配置、逐帧指标与清理证据见 `vllm_comparison/quality_libero/{findings.md,comparison.json,manifest.json,cleanup.json}`。
+- GPU2正式V/S/S/V当前V0、S1完成，各1 first+3 warmup+8 measured，独立保存块审计通过；仍等待后半序列，不提前用前半结果判定打平。这里只更新正确性观察，不修改生产代码或放宽此前S质量标准。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。
