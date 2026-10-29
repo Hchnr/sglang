@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from torch import Tensor, nn
 
+from .execution import _rms_mean_lastdim
+
 Rope = tuple[Tensor, Tensor]
 Streams = tuple[Tensor, Tensor, Tensor]
 UndKV = tuple[Tensor, Tensor]
@@ -72,7 +74,13 @@ class PwmRMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         value = x.float()
-        value = value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + self.eps)
+        squared = value.pow(2)
+        mean = (
+            _rms_mean_lastdim(squared)
+            if torch.compiler.is_compiling()
+            else squared.mean(-1, keepdim=True)
+        )
+        value = value * torch.rsqrt(mean + self.eps)
         return self.weight * value.to(x.dtype)
 
 
@@ -571,12 +579,17 @@ class PwmWamTransformer(nn.Module):
             layer._attention = attend
             # Preserve BF16 operator boundaries across prefill and generation.
             # Eliding casts makes cached KV and same-graph UND round differently.
+            # Pattern matching can fuse mm + residual into addmm, removing the
+            # original BF16 rounding of the mm output even with emulated casts.
             layer._compiled_forward = (
                 torch.compile(
                     layer.forward,
                     fullgraph=True,
                     dynamic=True,
-                    options={"emulate_precision_casts": True},
+                    options={
+                        "emulate_precision_casts": True,
+                        "pattern_matcher": False,
+                    },
                 )
                 if enable_torch_compile
                 else None
@@ -586,7 +599,10 @@ class PwmWamTransformer(nn.Module):
                     layer.prefill_und,
                     fullgraph=True,
                     dynamic=True,
-                    options={"emulate_precision_casts": True},
+                    options={
+                        "emulate_precision_casts": True,
+                        "pattern_matcher": False,
+                    },
                 )
                 if enable_torch_compile
                 else None

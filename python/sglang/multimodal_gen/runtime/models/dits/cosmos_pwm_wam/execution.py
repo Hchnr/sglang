@@ -1,8 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Private compile boundary for WAM's use of the existing SGLang FA3 kernel."""
+"""Private compile boundaries for WAM attention and faithful RMS reduction."""
 
 import torch
 from torch import Tensor
+
+
+@torch.library.custom_op("sglang::pwm_wam_rms_mean", mutates_args=())
+def _rms_mean_lastdim(value: Tensor) -> Tensor:
+    # Preserve the original ATen reduction order. Inductor's autotuned reduction
+    # tiles can change FP32 sums enough to cross the following BF16 rounding.
+    return value.mean(-1, keepdim=True)
+
+
+@_rms_mean_lastdim.register_fake
+def _rms_mean_lastdim_fake(value):
+    return value.new_empty((*value.shape[:-1], 1))
 
 
 def _run_flash3(
