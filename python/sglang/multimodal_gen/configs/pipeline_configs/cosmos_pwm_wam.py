@@ -61,6 +61,18 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
     def supports_native_grouped_requests(self) -> bool:
         return False
 
+    @staticmethod
+    def runtime_attention_backend(server_args: Any) -> str:
+        backend = server_args.attention_backend
+        if backend in (None, "torch_sdpa", "sdpa"):
+            return "sdpa"
+        if backend == "flash3":
+            return "flash3"
+        raise ValueError(
+            "Cosmos PWM WAM requires --attention-backend torch_sdpa or flash3; "
+            "flash3 explicitly selects FlashAttention 3"
+        )
+
     def validate_server_args(self, server_args: Any) -> None:
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
         from sglang.multimodal_gen.runtime.server_args import Backend
@@ -91,8 +103,8 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
             raise ValueError("Cosmos PWM WAM supports one GPU with TP=SP=DP=1")
         if server_args.batching_max_size != 1:
             raise ValueError("Cosmos PWM WAM requires --batching-max-size 1")
-        if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
-            raise ValueError("Cosmos PWM WAM currently supports eager execution only")
+        if server_args.enable_breakable_cuda_graph:
+            raise ValueError("Cosmos PWM WAM does not support breakable CUDA graph")
         if server_args.regional_compile:
             raise ValueError("Cosmos PWM WAM does not support regional_compile")
         if server_args.cache_dit_config is not None:
@@ -124,8 +136,7 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
                 "--image-encoder-cpu-offload false --vae-cpu-offload false "
                 "--dit-layerwise-offload false --use-fsdp-inference false"
             )
-        if server_args.attention_backend not in (None, "torch_sdpa", "sdpa"):
-            raise ValueError("Cosmos PWM WAM requires --attention-backend torch_sdpa")
+        self.runtime_attention_backend(server_args)
         if server_args.component_attention_backends:
             raise ValueError(
                 "Cosmos PWM WAM does not accept component attention overrides"
@@ -185,6 +196,8 @@ class CosmosPWMWAMPipelineConfig(PipelineConfig):
                 "exact_prefix_cache": False,
                 "request_local_und_cache": True,
                 "cross_request_und_cache": False,
+                "torch_compile": True,
+                "attention_backends": ["torch_sdpa", "flash3"],
                 "realtime_websocket": False,
                 "openpi_websocket": False,
             },

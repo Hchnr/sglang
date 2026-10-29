@@ -379,13 +379,37 @@ class TestCosmosPWMWAMServing(CustomTestCase):
         self.assertIsNone(resolved.cache_dit_config)
         self.assertFalse(resolved.regional_compile)
         self.assertFalse(resolved.enable_attention_backend_autotune)
+        # Backend/version selection must survive generic ServerArgs resolution.
+        for attention in ("torch_sdpa", "flash3"):
+            for compile_enabled in (False, True):
+                with self.subTest(attention=attention, compile=compile_enabled):
+                    optimized = ServerArgs.from_kwargs(
+                        **{
+                            **kwargs,
+                            "attention_backend": attention,
+                            "enable_torch_compile": compile_enabled,
+                        }
+                    )
+                    self.assertEqual(
+                        optimized.pipeline_config.runtime_attention_backend(optimized),
+                        "sdpa" if attention == "torch_sdpa" else "flash3",
+                    )
+                    self.assertIs(optimized.enable_torch_compile, compile_enabled)
+                    self.assertTrue(
+                        optimized.pipeline_config.action_metadata(optimized)[
+                            "capabilities"
+                        ]["torch_compile"]
+                    )
         for field, value, message in (
             ("cache_dit_config", {}, "cache_dit_config"),
             ("regional_compile", True, "regional_compile"),
             ("enable_attention_backend_autotune", True, "autotuning"),
+            ("enable_breakable_cuda_graph", True, "CUDA graph"),
+            ("attention_backend", "fa4", "FlashAttention 3"),
+            ("attention_backend", "sage_attn", "FlashAttention 3"),
         ):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
-                ServerArgs.from_kwargs(**kwargs, **{field: value})
+                ServerArgs.from_kwargs(**{**kwargs, field: value})
 
     def test_unsupported_action_fields_fail_instead_of_disappearing(self):
         for parameters in (

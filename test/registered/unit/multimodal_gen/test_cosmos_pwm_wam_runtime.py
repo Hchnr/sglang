@@ -54,12 +54,17 @@ class _VelocityModel(nn.Module):
         self.observations.append((video.clone(), action.clone()))
         return ids, video, action
 
-    def build_und_cache(self, ids, rope):
+    def build_attention_metadata(self, lengths, *, device):
+        return None
+
+    def build_und_cache(self, ids, rope, *, attention_metadata=None):
         cache = ids.clone()
         self.caches.append(weakref.ref(cache))
         return cache
 
-    def forward_hidden(self, streams, rope, action_rope, *, und_cache=None):
+    def forward_hidden(
+        self, streams, rope, action_rope, *, und_cache=None, attention_metadata=None
+    ):
         return streams if und_cache is None else (und_cache, *streams[1:])
 
     def decode_outputs(self, streams, *args, action_dim_mask):

@@ -177,6 +177,11 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--gpu-id", type=int, default=0)
+    parser.add_argument(
+        "--attention-backend", choices=("torch_sdpa", "flash3"), default="torch_sdpa"
+    )
+    parser.add_argument("--enable-torch-compile", action="store_true")
+    parser.add_argument("--enable-und-cache", action="store_true")
     args = parser.parse_args()
 
     import uvicorn
@@ -193,15 +198,16 @@ def main() -> None:
         pipeline_config={
             "vae_path": args.vae_path,
             "tokenizer_path": args.tokenizer_path,
+            "enable_und_cache": args.enable_und_cache,
         },
-        attention_backend="torch_sdpa",
+        attention_backend=args.attention_backend,
         num_gpus=1,
         base_gpu_id=args.gpu_id,
         tp_size=1,
         sp_degree=1,
         batching_max_size=1,
         enable_cfg_parallel=False,
-        enable_torch_compile=False,
+        enable_torch_compile=args.enable_torch_compile,
         enable_breakable_cuda_graph=False,
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,

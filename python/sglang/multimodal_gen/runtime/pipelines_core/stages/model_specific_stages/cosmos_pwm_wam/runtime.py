@@ -89,14 +89,19 @@ class PwmWamRuntime(nn.Module):
         tokenizer_path: str,
         device: str | torch.device = "cuda",
         attention_backend: str = "sdpa",
+        enable_torch_compile: bool = False,
         enable_und_cache: bool = False,
     ):
         super().__init__()
-        if attention_backend != "sdpa":
-            raise ValueError("PWM WAM currently supports eager SDPA only")
+        if attention_backend not in ("sdpa", "flash3"):
+            raise ValueError("PWM WAM supports attention_backend sdpa or flash3")
+        if type(enable_torch_compile) is not bool:
+            raise ValueError("enable_torch_compile must be a boolean")
         if type(enable_und_cache) is not bool:
             raise ValueError("enable_und_cache must be a boolean")
         self.enable_und_cache = enable_und_cache
+        self.attention_backend = attention_backend
+        self.enable_torch_compile = enable_torch_compile
         from diffusers import AutoencoderKLWan
         from transformers import AutoTokenizer
 
@@ -118,6 +123,10 @@ class PwmWamRuntime(nn.Module):
         validate_action_registry(self.spec)
         self.transformer = PwmWamTransformer.from_pretrained(
             checkpoint, device=self.device, dtype=torch.bfloat16, load_mode="serial"
+        )
+        self.transformer.configure_inference(
+            attention_backend=attention_backend,
+            enable_torch_compile=enable_torch_compile,
         )
         contract = {
             "action128_spec": self.spec,
@@ -266,7 +275,11 @@ class PwmWamRuntime(nn.Module):
             action_ropes = tuple(
                 rotary(p, dtype=torch.bfloat16, action=True) for p in positions
             )
-            branches.append((ids, ropes, action_ropes))
+            attention_metadata = self.transformer.build_attention_metadata(
+                (len(ids), grid[0] * grid[1] * grid[2], request.action_length),
+                device=self.device,
+            )
+            branches.append((ids, ropes, action_ropes, attention_metadata))
         use_und_cache = (
             self.enable_und_cache
             if request.enable_und_cache is None
@@ -280,10 +293,10 @@ class PwmWamRuntime(nn.Module):
         generator = torch.Generator(device=self.device).manual_seed(request.seed)
 
         def velocity(branch_index: int, timestep: Tensor) -> Tensor:
-            ids, rope, action_rope = branches[branch_index]
+            ids, rope, action_rope, attention_metadata = branches[branch_index]
             if use_und_cache and und_caches[branch_index] is None:
                 und_caches[branch_index] = self.transformer.build_und_cache(
-                    ids, rope[0]
+                    ids, rope[0], attention_metadata=attention_metadata
                 )
             streams = self.transformer.encode_inputs(
                 ids,
@@ -296,7 +309,11 @@ class PwmWamRuntime(nn.Module):
                 action_dim_mask=active,
             )
             hidden = self.transformer.forward_hidden(
-                streams, rope, action_rope, und_cache=und_caches[branch_index]
+                streams,
+                rope,
+                action_rope,
+                und_cache=und_caches[branch_index],
+                attention_metadata=attention_metadata,
             )
             vv, va = self.transformer.decode_outputs(
                 hidden,
@@ -402,6 +419,8 @@ class PwmWamRuntime(nn.Module):
                     if request.enable_und_cache is None
                     else request.enable_und_cache
                 ),
+                "attention_backend": getattr(self, "attention_backend", "sdpa"),
+                "enable_torch_compile": getattr(self, "enable_torch_compile", False),
             },
         }
 
@@ -421,7 +440,7 @@ class PwmWamRuntime(nn.Module):
             return self._forward(raw)
 
     def _forward(self, raw: dict) -> dict[str, Any]:
-        # This eager baseline records completed GPU work, including the small
+        # Record completed GPU work, including the small
         # synchronization cost at stage boundaries, rather than enqueue times.
         def timestamp() -> float:
             if self.device.type == "cuda":

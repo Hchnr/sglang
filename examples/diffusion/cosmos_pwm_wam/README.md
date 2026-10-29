@@ -234,8 +234,29 @@ payload = {
 响应的 `parameters.enable_und_cache` 记录本次实际选择。
 
 `runtime.prefix_cache` 和原始请求的 `enable_prefix_cache` 仍不支持开启。
-`enable_torch_compile`、`regional_compile`、`cache_dit_config`、attention backend
-autotuning 与非 SDPA attention backend 也仍会报错；UND 缓存不会隐式启用这些优化。
+`regional_compile`、`cache_dit_config` 与 attention backend autotuning 仍会报错。
+UND 缓存不会隐式开启 compile 或切换 attention backend。
+
+## FlashAttention 3 与编译
+
+Hopper GPU 上可以显式选择 `--attention-backend flash3`，并使用
+`--enable-torch-compile true` 编译重复的三塔 layers 与 UND prefill。
+Python 对应参数为 `attention_backend="flash3", enable_torch_compile=True`；
+原生 HTTP 服务与 Python worker 使用同一模型执行路径。`flash3` 是本 pipeline
+固定选择 FA3 的名称；通用 `fa3` / `fa4` 别名会被上层归一化，因此这里不接受。
+缺少 FA3 依赖、不支持的 GPU 或编译错误会直接报错。
+
+编译采用静态 shape，首个请求及新的条件长度/视频形状/缓存分支会触发编译；
+请用实际请求预热，并将首次编译时间与稳定态延迟分别记录。
+请求内 attention 边界与 UND cache 分别属于每个 CFG 分支，不跨请求复用。
+FP32 solver、步数、CFG、噪声与完整 VIDEO/ACTION 联合生成合同保持不变。
+FA3 与编译融合可能改变浮点舍入，具体输出误差与性能必须以目标环境验证为准。
+结果 `parameters.attention_backend` 与 `parameters.enable_torch_compile`
+记录实际执行配置。
+
+兼容 facade 可传 `--attention-backend flash3 --enable-torch-compile
+--enable-und-cache`。手工验证工具支持 `--attention-backend flash3
+--enable-torch-compile`，可分别运行 `--route runtime` 和 `--route python`。
 
 ## HTTP 与 Cosmos 兼容入口
 
@@ -289,7 +310,7 @@ facade 提供 `/healthz`、`/models`、`/info`、`/domains` 和 `/outputs`，返
 
 当前支持单 GPU、单 observation、单输出、无状态 WAM、BF16 网络/VAE 与 FP32
 联合 UniPC solver。暂不支持其他 action 模式、机器人 state/action 条件输入、
-多候选、动态 batching、TP/SP/DP/CFG 并行、offload、量化、LoRA、compile、CUDA
+多候选、动态 batching、TP/SP/DP/CFG 并行、offload、量化、LoRA、CUDA
 graph、prefix cache、realtime/OpenPI WebSocket。错误请求不会变更下次请求的 seed、
 mask、条件或 solver 历史。媒体需要下载/解码，因此真实媒体与声明布局的匹配检查
 在 worker 中完成；纯参数和声明布局在入队前校验。

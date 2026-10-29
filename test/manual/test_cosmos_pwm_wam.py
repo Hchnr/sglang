@@ -133,6 +133,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--route", choices=("runtime", "python"), default="python")
     parser.add_argument(
+        "--attention-backend", choices=("torch_sdpa", "flash3"), default="torch_sdpa"
+    )
+    parser.add_argument("--enable-torch-compile", action="store_true")
+    parser.add_argument(
         "--reference",
         type=Path,
         help="Compare the first request against saved reference",
@@ -179,7 +183,13 @@ def main():
         )
 
         runtime = PwmWamRuntime(
-            args.checkpoint, vae_path=str(args.vae), tokenizer_path=str(args.tokenizer)
+            args.checkpoint,
+            vae_path=str(args.vae),
+            tokenizer_path=str(args.tokenizer),
+            attention_backend=(
+                "sdpa" if args.attention_backend == "torch_sdpa" else "flash3"
+            ),
+            enable_torch_compile=args.enable_torch_compile,
         )
         run = runtime.forward
     else:
@@ -195,13 +205,13 @@ def main():
                 "tokenizer_path": str(args.tokenizer),
             },
             backend="sglang",
-            attention_backend="torch_sdpa",
+            attention_backend=args.attention_backend,
             num_gpus=1,
             tp_size=1,
             sp_degree=1,
             batching_max_size=1,
             enable_cfg_parallel=False,
-            enable_torch_compile=False,
+            enable_torch_compile=args.enable_torch_compile,
             enable_breakable_cuda_graph=False,
             dit_cpu_offload=False,
             text_encoder_cpu_offload=False,
@@ -219,6 +229,8 @@ def main():
         "route": args.route,
         "argv": sys.argv,
         "und_cache": args.und_cache,
+        "attention_backend": args.attention_backend,
+        "enable_torch_compile": args.enable_torch_compile,
         "warmup_rounds": args.warmup,
         "load_seconds": time.perf_counter() - started,
         "gpu": torch.cuda.get_device_name(),

@@ -18,6 +18,16 @@
 - 基础性能达标后才报告收益；缓存对自身的收益不能替代相对 Cosmos 的收益。若实测仍慢，依据 profile 继续定位，保留所有反向结果。
 - 并行分工：模型后端/编译、对照工具、独立审查与模型单测；主任务负责 runtime/配置接线、正式 GPU 对照、文档与提交。开始时四张 H100 均空闲，GPU0/1 给组件验证、GPU2 给正式性能对照。
 
+### 决策 D13：生产后端与诊断替代边界明确区分
+
+生产 FA3 使用 SGLang 已有 kernel 的显式 `ver=3`，不依赖 Cosmos/vLLM；命名采用 `flash3`，避免通用 ServerArgs 把 `fa3` / `fa4` 都归一化为 `fa` 后丢失用户要求的版本。metadata 每请求/CFG 分支构造一次。compile 使用 fullgraph 静态每层/UND prefill，失败直接抛出，保留未编译路径。runtime、Python/HTTP pipeline、兼容 facade 和手工 harness 均显式传入配置，响应参数回显实际选择。
+
+目标 S 环境固定 Torch 2.14.1/Transformers 5.19，源 C 环境是 Torch 2.10/Transformers 4.57。优先尝试同 2.14 环境运行真实 Cosmos reference；若需要在 C2.10 环境以 provider adapter 运行 native leaf，仅作为数学诊断，并记录 adapter/source SHA，不把它称为生产 SGLang worker。真实 worker 另测，不以父进程 Dynamo counters 证明子进程编译。
+
+初查把 Cosmos 的 QKV 融合源码误当成已测 baseline 的有效配置，进一步核对已纠正：它由 `action_server.py --fuse-qkv` 显式开启，10/28 的 reference worker 未调用该入口。当前先不混入 QKV/solver/量化/近似缓存优化，待 FA3+compile 公平实测后决定。
+
+阶段验证：目标 S2.14/H100 已实际调用 SGL FA3，输出有限。serving 单测 15 passed +43 subtests，runtime 单测 17 passed +22 subtests；首次 serving 冷导入耗时 277.71 s，不是推理性能。Ruff 选定规则、format、isort 与 diff 检查通过。FA3 整层 GPU 编译及全模型性能仍在进行，尚未宣称达标。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。
