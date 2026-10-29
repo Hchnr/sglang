@@ -127,6 +127,15 @@
 - 视频41帧均通过原SSIM≥0.92/PSNR≥24dB，最差frame27为0.946424944/25.810457791dB；pixel MAE=1.777122065。视频过门槛不覆盖动作差异；未将差异全部归因于mask、编译或FA3 provider中的单一因素。原始数组、实际配置、逐帧指标与清理证据见 `vllm_comparison/quality_libero/{findings.md,comparison.json,manifest.json,cleanup.json}`。
 - GPU2正式V/S/S/V当前V0、S1完成，各1 first+3 warmup+8 measured，独立保存块审计通过；仍等待后半序列，不提前用前半结果判定打平。这里只更新正确性观察，不修改生产代码或放宽此前S质量标准。
 
+### 决策 D26：按完整原样 runtime 复测报告未打平
+
+- GPU2正式V/S/S/V完整结束，四进程全部exit0，各1 first+3 warmup+8 measured，共48请求/32正式样本。双方各16 measured：V median1.954785768s、mean1.961071643s；S median2.136538582s、mean2.141598731s；S相对延迟+9.29784%，多0.181752814s，未达到D23预设≤5%的工程观察口径。不因本次不利结果改口称持平，也不混用旧环境/旧Cosmos数字。
+- 四块中位数分别V1.955783268、S2.139609415、S2.131493382、V1.951740032s，全部离群值保留。构建/首次耗时分别153.605/190.627、12.304/30.143、11.179/8.773、11.120/6.552s；import、构建、first/warmup与正式wall分离，不将磁盘缓存命中后的后续进程称完全冷启动。V原有CPU list构造仍在同步调用内，测后字段适配和保存不进入耗时。
+- 两端同Torch2.14.1/cuDNN9.24/固定原始请求及资产，真实FA3+compile+UND cache，有效双TF32=False、BF16 reduction=True、deterministic=False。V保留实际package/bundled FA3，未替换provider、未修改模型/采样/compile选项；FP8/近似缓存/graph/QKV或gate-up融合/多GPU均不叠加。仅runtime对runtime，不冒充engine/HTTP吞吐或包含S worker IPC的测量。
+- 本轮formal每端24次完整Action128/normalized分别自重复exact；S全部对Cosmos FA3 eager主场景exact，V相对该锚点active physical L2=.459180059、normalized=.576815950。D25独立带视频编译上下文V为.460072202/.578084861，单独保留；**formal V0/V3不存在漂移**。输出差异与mask/编译/provider区别同时披露，不把9.30%当成同数学或等质量可替换结论，也不将差距或输出差异归因于单一开关。
+- `formal_runtime/independent_audit.json` PASS：44冻结文件实际SHA、每块phase/数量、32原始耗时及48质量记录、实际provider/环境/精度、418条目标GPU观察和每块起止空闲核对。主任务另以stdlib重算统计/44当前SHA，`formal_runtime/root_recheck.json`一致；quality数组也独立NumPy重算一致。GPU观测最长间隔3s，不能精确映射host/namespace PID；asset配置hash不冒充权重hash。
+- 报告加入最终vLLM表格、构建/first、原样语义差异、动作与视频检查及复现路径；此前Cosmos验收结果保持单独说明。本轮无生产代码变更、无新public test/CI注册、无外部checkout或环境写入；所有本任务GPU进程退出，GPU0/2归零、收尾四卡compute列表为空。性能未打平是本次比较的结论，不以放宽既有S正确性标准规避。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。

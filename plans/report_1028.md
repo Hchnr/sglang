@@ -2,6 +2,8 @@
 
 2026-10-29 最终结论：指定checkpoint的单GPU/B1原生WAM接入、质量验证和性能验收已完成。相对同时开启compile与FlashAttention 3的Cosmos Baseline，稳定态runtime延迟下降 **6.50%**，真实Python worker（含通信）下降 **7.51%**。六场景134帧视频与同环境源FA3 eager逐像素一致；动作误差和支持边界如下。本文取代此前eager阶段结论，旧结果和失败实验继续保留于实施记录、Git历史和artifacts。
 
+10/29补测本地vLLM-Omni PWM：同卡/同软件栈、两端compile+FA3+UND cache，vLLM runtime中位 **1.954786s**、SGLang **2.136539s**，SGLang延迟高 **9.30%**，目前尚未打平。原样V/S的动作采样数学也有差别；速度与输出差异在下文分别报告，不将此结果解释为等质量实现的速度排名。
+
 生产数值修复为 `e9be9ec135`，后续提交仅涉及测试和文档。完整决策与提交过程见 [record_1028.md](record_1028.md)，原始设计见 [plan.md](plan.md)，实际部署命令见 [README](../examples/diffusion/cosmos_pwm_wam/README.md)。
 
 ## 最终性能对照
@@ -44,11 +46,45 @@ runtime速度比为1.06952×，平均值C/S分别2.313672/2.163292 s；worker速
 
 ## 与本地 vLLM-Omni PWM 的补充对照（10/29）
 
-原样vLLM的输出检查已完成，稳定态V/S/S/V性能序列仍在测量；本节不以此前Cosmos对照数字推断vLLM性能。两端在S目标软件栈执行各自真实native runtime、compile+FA3+请求内UND cache，vLLM使用其实际bundled FA3，没有provider替换或数学补丁。
+**当前尚未打平：SGLang比本地vLLM原样native runtime慢9.30%，每请求约多182ms。** 测前采用中位延迟差≤5%的工程观察口径，本次未达到；这个口径不是统计等价检验。此前Cosmos对照的6.50%/7.51%不外推为vLLM结论。
 
-同一主尺寸带视频请求（原10-active Action128 mask、40 actions/41帧、5 steps/CFG1.5/seed42），vLLM两次完整动作/normalized/video重复exact。对当前S最终输出及同环境Cosmos FA3 eager，active physical relative L2均为 **0.460072202**（max_abs1.253084064），normalized relative L2为 **0.578084861**。视频全部41帧通过既有门槛，最低SSIM **0.946424944**、PSNR **25.810457791dB**，pixel MAE1.777122065；离散合同一致且inactive输出全零。**动作仍有显著差异，视频通过不能作为动作数值等价或机器人业务质量相同的证据。**
+固定同一H10080GB/GPU2、BF16/B1、checkpoint、原始输入及10-active Action128 mask。请求仍为Libero960×640、40 actions/41 frames、5 steps、CFG1.5、shift5、seed42；不做最终视频decode，但保留完整三塔联合生成。双方真实native runtime均开启compile+FA3+请求内UND cache，在同一S目标环境（Torch2.14.1、CUDA13、cuDNN9.24、Triton3.8、Diffusers0.37、Transformers5.19）运行；有效双TF32=False、BF16 reduced-precision reduction=True、deterministic=False。
 
-源码显示V只在最终输出屏蔽inactive action槽位，S/Cosmos在采样过程中持续屏蔽；编译算术和实际FA3 provider也有差别。这次检查没有分离三者的因果，不能把相同JSON视作相同数学。原始数组、逐帧分数、实际provider/source hash及正常退出证据见 [quality findings](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/findings.md) 和 [comparison.json](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/comparison.json)。
+完整V/S/S/V四个独立加载进程，每块1次first+3次warmup+8次measured，共48请求，双方各16正式样本；全部离群值保留。
+
+| 原样直接runtime | 正式样本 | 中位延迟 | 平均延迟 | 最小 / 最大 |
+| --- | ---: | ---: | ---: | ---: |
+| vLLM-Omni PWM | 16 | 1.954786s | 1.961072s | 1.938106 / 2.060070s |
+| SGLang PWM | 16 | 2.136539s | 2.141599s | 2.129162 / 2.193755s |
+
+四块中位数按顺序为V1.955783、S2.139609、S2.131493、V1.951740s，反向顺序没有消除差距。外层同步计时从raw请求开始，到CPU动作返回结束，V原有CPU列表构造成本留在调用内，字段适配/数组保存位于计时外；没有使用V在视频decode前记录的内部elapsed冒充完整wall time。本次是runtime比较，不是HTTP、完整engine吞吐或SGLang Python worker比较；V单卡engine为inline UniProc，不能假设与S worker有相同IPC边界。
+
+| 进程块 | runtime构建 | 首次请求（含编译/缓存加载） |
+| --- | ---: | ---: |
+| V0 | 153.605s | 190.627s |
+| S1 | 12.304s | 30.143s |
+| S2 | 11.179s | 8.773s |
+| V3 | 11.120s | 6.552s |
+
+import、模型构建、首请求与稳定态分开记录；NFS和磁盘缓存状态影响前者。两种实现分别从新编译目录开始，各自后续进程共享对应缓存，不宣称四次完全冷启动。vLLM使用真实package及其bundled FA3，S使用已有SGL FA3；没有namespace隔离、provider替换、数学补丁或外部环境修改。V的FP8、近似velocity cache、跨请求UND cache、CUDA graph、融合QKV/gate-up及多GPU均关闭，与原有普通BF16 compile+FA3配置对照。历史可选融合/graph证据收益很小或有数值差异，未堆叠为另一未经当前质量验证的Baseline。
+
+源码中几项相关区别：
+
+- V只在最终输出屏蔽inactive action槽位，S/Cosmos在初始噪声、网络边界和逐步采样中持续屏蔽。因此相同JSON不代表相同数学。
+- V使用默认静态整层compile；S使用共享动态prefill/gen，并保留原ATen mean及BF16中间舍入。S这些数值边界由此前DROID回归证明必要，不能仅为延迟取消。
+- FA3实际provider、UND缓存保存内容及CPU返回容器也不同。这次未做单因素性能消融，不能把182ms全归因于其中一项。
+
+正式序列中，V的24次完整动作/normalized彼此exact，两个fresh进程间也exact；S的24次完整数组同样彼此exact，且均对同环境Cosmos FA3 eager主场景exact，另经 [原始数组独立核验](../artifacts/pwm_wam_1029/vllm_comparison/formal_runtime/final_audit.json) 确认。V对该锚点active physical relative L2=0.459180059、normalized=0.576815950，不是动作数值等价。
+
+另在GPU0、独立编译上下文对同一主尺寸**带视频**请求执行两次原样V推理。完整动作/normalized/video自身重复exact；对当前S最终输出及Cosmos FA3 eager，active physical relative L2均为 **0.460072202**（max_abs1.253084064、RMSE0.247408028），normalized relative L2为 **0.578084861**。视频全部41帧通过既有门槛，最低SSIM **0.946424944**、PSNR **25.810457791dB**，pixel MAE1.777122065；离散合同一致且inactive输出全零。这个独立上下文与formal序列的V输出有区别，未混为同一次运行或谎报formal两个进程漂移。**动作差异显著，视频通过不能作为动作数值等价或机器人业务质量相同的证据；本次也未分离mask/编译/provider对差异的因果。**
+
+证据与复现入口：
+
+- [正式逐样本统计与动作比较](../artifacts/pwm_wam_1029/vllm_comparison/formal_runtime/comparison.json)、[命令/执行计划](../artifacts/pwm_wam_1029/vllm_comparison/formal_runtime/plan.json)；各block manifest保存实际argv/env、配置、provider及源码SHA。
+- [独立审计PASS](../artifacts/pwm_wam_1029/vllm_comparison/formal_runtime/independent_audit.json)、[主任务独立重算](../artifacts/pwm_wam_1029/vllm_comparison/formal_runtime/root_recheck.json)：44个冻结文件当前SHA匹配，32个正式耗时全部纳入，记录的TF32、deterministic及BF16 reduction开关一致，四进程exit0，GPU2每块起止空闲。约2秒GPU采样最大间隔3秒，不声称精确host/namespace PID映射或整机独占。
+- [视频/动作检查](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/findings.md)、[逐帧指标](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/comparison.json)、[独立NumPy重算](../artifacts/pwm_wam_1029/vllm_comparison/quality_libero/root_recheck.json)、[只读源码/历史审计](../artifacts/pwm_wam_1029/vllm_native_source_audit.json)。资产元数据hash不替代既有权重SHA。
+
+V checkout为`d3e9aad33e861b69be16c4f341695e1cc12b3314`且有1280项既有staged变更，PWM模型/tools本身无局部改动；以上结论绑定实际文件SHA，不宣称全仓clean HEAD。本轮只新增本机比较证据和文档，没有修改两端生产代码或外部checkout；所有比较进程正常退出，GPU0/2释放，收尾四卡compute列表为空。
 
 ## 最终质量与状态隔离
 
