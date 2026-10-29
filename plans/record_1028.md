@@ -98,6 +98,13 @@
 - 当前支持范围的原生接入、质量和加速目标已完成；最终报告和部署recipe按实际支持能力重写。46项WAM单测、六场景134帧、不同首次shape、实际runtime/worker、两HTTP入口均有证据。动作矩阵两个单值末位差异、非干净容器环境和未运行远端CI等边界明确保留，未推广为业务闭环成功率或所有shape/硬件收益。
 - 所有本任务服务/worker/验证进程退出，收尾GPU compute列表为空、视频stores清空。只在本分支频繁本地提交，没有远端推送、外部checkout写入或停止外部作业；源码最后数值修复为`e9be9ec135`，之后均tests/docs变更。
 
+### 决策 D22：再次核对正确性结论与当前代码身份
+
+- 用户追问正确性结论后，重新逐数组读取六场景native/Cosmos FA3 eager原始NPZ，采用独立NumPy比较，不导入既有验证helper。134帧视频仍全部逐像素exact；4场景完整动作/normalized exact，DROID和Robotwin各仅1个元素不同。max_abs、relative_L2、离散合同、有限性及inactive全零均与原报告一致，未改变原阈值。
+- 补充差异精度：DROID `[52,2]` physical差1.164153218e-10（2ULP）、normalized差7.450580597e-9（1ULP）；Robotwin `[3,11]` 两数组均差5.960464478e-8（1ULP）。最初新诊断错误假设“每个差值均1ULP”并在DROID停止；该假设不是既有验收标准，修正后如实记录各实际spacing，不把它变成放宽业务容差。说明和结果保留在 `correctness_recheck_20261029/{audit.json,audit_notes.md}`。
+- 核验HEAD `9e688e78`的当前工作树/HEAD blob与质量、性能、HTTP运行冻结生产SHA匹配；独立审查确认cache66数组、首次shape36数组、实际worker24次双锚点及HTTP8请求证据，另抽核两worker进程的首末动作NPZ一致。生产代码没有变化，因此本轮只复核已有GPU输出及身份，不重复运行GPU或改生产/测试代码。
+- 结论范围仍为指定checkpoint/环境/单GPU/B1请求集的数值及接口回归；不是全动作bitwise保证，也没有机器人闭环成功率评测。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。

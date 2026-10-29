@@ -59,6 +59,8 @@ runtime速度比为1.06952×，平均值C/S分别2.313672/2.163292 s；worker速
 
 共134帧，SSIM=1、PSNR=∞；固定逐帧门槛仍为SSIM≥0.92、PSNR≥24dB，未放宽。DROID/Robotwin各有一个FP32动作值存在上述末位差异，不宣称全矩阵动作bitwise；也不把数值验证转化为机器人闭环成功率结论。完整active/full-width误差、逐帧得分和三组source/native比较见 [comparison.json](../artifacts/pwm_wam_1029/final_boundary_quality/comparison.json)，简表见 [acceptance_summary.json](../artifacts/pwm_wam_1029/final_boundary_quality/acceptance_summary.json)。
 
+10/29再次独立复核原始NPZ和当前源码SHA，结果与上述报告一致，见 [correctness recheck](../artifacts/pwm_wam_1029/correctness_recheck_20261029/audit.json)。DROID差异坐标为`[52,2]`：physical相差2个FP32 ULP，normalized相差1个；Robotwin为`[3,11]`，两数组均相差1个ULP。其余元素一致，inactive槽位全0；domain/mask/频率/seed/时间戳/caption摘要相同。ULP仅描述观察到的差异，不是新设定的业务容差。本次是对已保存GPU原始输出的CPU重算与当前生产代码身份核验，没有重新运行GPU推理或改变原验收门槛。
+
 每个场景off/on/on/off，之后回访Libero，共28请求；22组重复/回访、66个完整动作/normalized/video数组比较全部exact。另一全新进程与编译缓存以DROID-first→smoke→DROID运行12请求，36数组与上述smoke-first矩阵exact，见 [首次shape交叉](../artifacts/pwm_wam_1029/final_boundary_droid_first/cross_first_shape_comparison.json)。最终runtime两个进程的 [24次主尺寸动作和normalized](../artifacts/pwm_wam_1029/final_boundary_runtime/source_eager_main_comparison.json)，以及两个真实worker的24次输出，包含首次/预热/正式样本，共48次完整数组均对源FA3 eager和最终质量矩阵主场景双锚点exact；逐样本证据在完整统计中。
 
 源compile自身在DROID相对源eager存在明显漂移，最差SSIM0.875546、PSNR20.1516dB，未通过同一视频门槛。因此不能用源compiled输出替代原始数值语义，也不能把它当作允许本实现漂移的容差。最终native相对该compiled输出的差异仍披露在完整比较中，未修改Baseline数学或隐藏该结果。
