@@ -97,3 +97,29 @@ worker route they are explicitly labeled parent-only and are not evidence of
 worker compilation. Use actual result backend/compile flags, worker logs, source
 hashes, and a separate runtime profiler trace when compiled-kernel evidence is
 needed. Do not compare parent CUDA allocator statistics to worker memory.
+
+The summary keeps caller numerical flags separate from effective request policy.
+Native IEEE policy is taken from the response's in-scope TF32 getters. Older
+native outputs without these fields remain unknown; caller flags are not used to
+certify them. Cosmos global flags require a source audit confirming no inner
+precision override. `same_effective_fp32_policy` is separate from matching
+software versions, and neither establishes output equivalence. Mixing harness
+hashes, caller policies, or effective policies within one implementation is
+rejected. The analysis tool's own hash is recorded separately from the frozen
+harness that generated each sample.
+
+`pwm_wam_compare_quality.py` compares six-scene (or other matching case-set)
+compiled/eager Cosmos outputs with a native matrix, including source repeat
+stability and full-width/active actions. It computes framewise SSIM with Gaussian
+window 11, sigma 1.5 and population covariance, plus full-frame PSNR. The video
+thresholds remain SSIM 0.92 and PSNR 24 dB; source compiler drift does not relax
+these gates or create an action tolerance. For a native cache ABBA matrix, the
+first result of each four-result group is selected by the default stride:
+
+```bash
+python test/manual/pwm_wam_compare_quality.py \
+  --native-directory /results/native-quality/run \
+  --source-compiled /results/cosmos-compiled-quality \
+  --source-eager /results/cosmos-eager-quality \
+  --output /results/quality-comparison.json
+```

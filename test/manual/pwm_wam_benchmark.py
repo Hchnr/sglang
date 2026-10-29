@@ -646,6 +646,30 @@ def run_child(args):
         raise RuntimeError("Source files changed during benchmark; discard this block")
 
 
+def effective_fp32_policy(manifest, sample):
+    parameters = sample.get("parameters") or {}
+    result_names = ("fp32_matmul_allow_tf32", "fp32_cudnn_allow_tf32")
+    if all(type(parameters.get(key)) is bool for key in result_names):
+        return {
+            "flags": {key: parameters[key] for key in result_names},
+            "evidence": "native response getters inside the runtime precision scope",
+        }
+    if manifest["implementation"] == "cosmos":
+        numerics = manifest.get("numerics", {})
+        mapping = dict(
+            zip(result_names, ("matmul_allow_tf32", "cudnn_allow_tf32"), strict=True)
+        )
+        if all(type(numerics.get(key)) is bool for key in mapping.values()):
+            return {
+                "flags": {key: numerics[value] for key, value in mapping.items()},
+                "evidence": "Cosmos model-global flags observed before calls; source audit must verify no inner override",
+            }
+    return {
+        "flags": {key: None for key in result_names},
+        "evidence": "not instrumented; caller flags are not evidence of native in-scope policy",
+    }
+
+
 def summarize(output):
     import numpy as np
     from test_cosmos_pwm_wam import array_metrics, compare_reference
@@ -656,6 +680,7 @@ def summarize(output):
     request_by_case = {}
     timings = {}
     identity_by_impl = {}
+    precision_by_impl = {}
     comparisons = []
     for folder in sorted(path for path in output.glob("block_*") if path.is_dir()):
         manifest = json.loads((folder / "manifest.json").read_text())
@@ -673,6 +698,8 @@ def summarize(output):
                 "torch_cuda",
                 "cudnn",
                 "native_route",
+                "harness_sha256",
+                "numerics",
             )
         }
         previous = identity_by_impl.setdefault(impl, identity)
@@ -691,9 +718,18 @@ def summarize(output):
                 "cudnn": manifest["cudnn"],
                 "numerics": manifest["numerics"],
                 "options": manifest["options"],
+                "harness_sha256": manifest.get("harness_sha256"),
+                "numerics_scope": manifest.get(
+                    "numerics_process_scope", "legacy model process"
+                ),
             }
         )
         for sample in manifest["samples"]:
+            policy = effective_fp32_policy(manifest, sample)
+            if precision_by_impl.setdefault(impl, policy) != policy:
+                raise ValueError(
+                    f"Effective precision policy changed across samples: {impl}"
+                )
             case = sample["case"]
             request_hash = sample.get("request_sha256")
             if request_by_case.setdefault(case, request_hash) != request_hash:
@@ -748,8 +784,22 @@ def summarize(output):
             row["cosmos"]["median_seconds"] / row["native"]["median_seconds"]
         )
         rows.append(row)
+    known_policies = [value["flags"] for value in precision_by_impl.values()]
+    same_policy = (
+        all(
+            all(type(flag) is bool for flag in value.values())
+            for value in known_policies
+        )
+        and all(value == known_policies[0] for value in known_policies)
+        if known_policies
+        else False
+    )
     report = {
+        "analysis_harness_sha256": digest(__file__),
         "same_recorded_software_environment": same_env,
+        "same_effective_fp32_policy": same_policy,
+        "effective_fp32_policies": precision_by_impl,
+        "precision_policy_scope": "Native requires in-scope response flags. Cosmos uses observed model-global flags and requires a separate source audit for inner overrides. Missing legacy native flags are unknown. Matching policy is not numerical equivalence.",
         "blocks": blocks,
         "latency": rows,
         "output_comparisons": comparisons,
