@@ -69,6 +69,9 @@
 - 诊断仅保留原 ATen mean 边界，再显式关闭 `pattern_matcher`。DROID 与同环境 Cosmos FA3 eager 的33帧视频恢复逐像素exact，physical最大绝对差恢复为1.164153218e-10，与native eager相同。保持原质量门槛，下一步落地最小修复、完整六场景及不同首次shape复核，并重测正式runtime/worker性能。证据 `quality_droid_no_patterns/`；旧12.27%性能数字不作为修复后版本的最终收益。
 - 原始质量语义参考使用同环境同FA3的Cosmos eager，性能对照继续启用Cosmos compile+FA3；同时披露该source compile自身的数值漂移，不通过修改其配置制造更慢的Baseline。
 - 候选artifact的部分 `command.json` 沿用父脚本的“No compile/model monkeypatch”描述，实际诊断有进程内替换RMSNorm/编译选项（SiLU轮还替换F.silu）。这是诊断而非生产执行；补充说明纠正范围，不覆盖历史原始数据。最终生产验证必须使用未替换的原生代码。
+- 最小修复已提交 `e9be9ec135`。候选主尺寸Libero的全128维动作、normalized与Cosmos FA3 eager精确一致，生成图保留独立mm（gen14处/prefill7处）、addmm为0。生产代码冻结后开始新的28请求质量矩阵和7个fresh进程性能/worker序列，尚未提前引用候选耗时作最终验收。
+- 新增mean回归采用真实CPU Dynamo图执行和opcheck，覆盖8种2D/3D、FP32/BF16、连续/非连续输入，验证原eager输出、FP32归约、fake metadata与非alias。模型14项通过，旧forward红灯/新forward绿灯。CPU进程用`CUDA_VISIBLE_DEVICES=9`（本机只有0..3）绕过test_utils对空字符串的索引问题，device_count=0且CUDA未初始化，不占GPU0；不再需要之前的临时环境读取patch。
+- 部署文档改为显式推荐Hopper FA3+compile+UND缓存，并保留eager对照方法；类默认值未隐式切换。数值策略和首次编译成本写入说明。
 
 ## 2026-10-28 16:43：开始实施
 

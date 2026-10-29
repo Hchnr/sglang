@@ -37,13 +37,14 @@ pip install -e 'python[diffusion]'
 
 ## 启动原生 action 服务
 
+以下为 Hopper 的推荐配置，开启 FA3、动态编译和请求内 UND 复用。
 创建 `wam_pipeline.json`，将路径替换为实际资产目录：
 
 ```json
 {
   "vae_path": "/models/pwm-vae",
   "tokenizer_path": "/models/pwm-tokenizer",
-  "enable_und_cache": false
+  "enable_und_cache": true
 }
 ```
 
@@ -54,8 +55,8 @@ sglang serve \
   --pipeline-config-path wam_pipeline.json \
   --backend sglang --served-model-name cosmos-pwm-wam \
   --num-gpus 1 --tp-size 1 --sp-degree 1 --batching-max-size 1 \
-  --attention-backend torch_sdpa --enable-cfg-parallel false \
-  --enable-torch-compile false --enable-breakable-cuda-graph false \
+  --attention-backend flash3 --enable-cfg-parallel false \
+  --enable-torch-compile true --enable-breakable-cuda-graph false \
   --dit-cpu-offload false --dit-layerwise-offload false \
   --text-encoder-cpu-offload false --image-encoder-cpu-offload false \
   --vae-cpu-offload false --use-fsdp-inference false --warmup-mode off \
@@ -64,7 +65,9 @@ sglang serve \
 
 参与 WAM 推理的权重常驻单张 GPU；未使用的文本输出头 `lm_head.weight`
 在完整校验后保留 CPU，仍包含在 `state_dict` 中，不与输入 embedding 绑定。
-启动后用一个真实 WAM 请求完成预热。
+启动后用实际 WAM 请求完成编译和预热，首请求不代表稳定态延迟。
+需要 eager SDPA 对照时，显式使用 `--attention-backend torch_sdpa
+--enable-torch-compile false`，并将 pipeline 的 `enable_und_cache` 设为 `false`。
 `GET /v1/actions/metadata` 返回该 pipeline 的能力和默认参数。
 
 ## 构造请求
@@ -155,11 +158,11 @@ def main():
         pipeline_config={
             "vae_path": "/models/pwm-vae",
             "tokenizer_path": "/models/pwm-tokenizer",
-            "enable_und_cache": False,
+            "enable_und_cache": True,
         },
         num_gpus=1, tp_size=1, sp_degree=1, batching_max_size=1,
-        attention_backend="torch_sdpa", enable_cfg_parallel=False,
-        enable_torch_compile=False, enable_breakable_cuda_graph=False,
+        attention_backend="flash3", enable_cfg_parallel=False,
+        enable_torch_compile=True, enable_breakable_cuda_graph=False,
         dit_cpu_offload=False, dit_layerwise_offload=False,
         text_encoder_cpu_offload=False, image_encoder_cpu_offload=False,
         vae_cpu_offload=False, use_fsdp_inference=False, warmup_mode="off",
@@ -197,7 +200,8 @@ GPU 阶段边界执行同步，因此包含同步成本；不包含排队、HTTP
 
 ## 请求内 UND 缓存
 
-`pipeline_config.enable_und_cache` 控制请求内的 UND 计算复用，当前默认 `false`。
+`pipeline_config.enable_und_cache` 控制请求内的 UND 计算复用。类默认值为 `false`；
+上述部署示例显式设为 `true`。
 开启时，每个实际使用的条件分支只计算一次 UND，并在该请求的去噪步骤中复用
 逐层 K/V 和最终 UND hidden states。CFG 的正、负条件分别持有缓存；请求结束或
 失败后释放，后续请求重新计算。此开关不改变采样参数、动作单位或 action/video 字段的含义。
@@ -252,7 +256,9 @@ Python 对应参数为 `attention_backend="flash3", enable_torch_compile=True`�
 相同的 BF16 舍入；未缓存路径仍在每一步重新计算 UND。
 请求内 attention 边界与 UND cache 分别属于每个 CFG 分支，不跨请求复用。
 FP32 solver、步数、CFG、噪声与完整 VIDEO/ACTION 联合生成合同保持不变。
-FA3 与编译融合可能改变浮点舍入，具体输出误差与性能必须以目标环境验证为准。
+编译路径保留原 ATen RMS mean，并禁止将 BF16 GEMM 与残差相加重写成 addmm，
+避免消除原模型的中间舍入。仍需用目标环境的实际请求验证输出与性能；
+不能仅凭启用 compile 推断收益。
 结果 `parameters.attention_backend` 与 `parameters.enable_torch_compile`
 记录实际执行配置。
 WAM 请求内关闭 FP32 matmul/cuDNN 的 TF32，与 Cosmos 的 FP32 时间嵌入策略
@@ -301,6 +307,7 @@ video = result["data"][0].get("video")
 python -m sglang.multimodal_gen.runtime.entrypoints.action.pwm_compat \
   --model-path /models/pwm-hf --vae-path /models/pwm-vae \
   --tokenizer-path /models/pwm-tokenizer --model-name cosmos-pwm-wam \
+  --attention-backend flash3 --enable-torch-compile --enable-und-cache \
   --host 127.0.0.1 --port 8000 --output-dir outputs/pwm-wam
 curl -H 'Content-Type: application/json' --data-binary @request.json \
   http://127.0.0.1:8000/generate
@@ -337,6 +344,7 @@ python test/registered/unit/multimodal_gen/test_cosmos_pwm_wam_serving.py
 python test/manual/test_cosmos_pwm_wam.py \
   --checkpoint /models/pwm-hf --vae /models/pwm-vae \
   --tokenizer /models/pwm-tokenizer --request request.json \
+  --attention-backend flash3 --enable-torch-compile --und-cache compare \
   --route python --repeat 2 --output outputs/pwm-validation
 ```
 

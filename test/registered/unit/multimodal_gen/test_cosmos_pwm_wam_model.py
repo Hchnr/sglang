@@ -69,6 +69,78 @@ class TestPwmModelContracts(CustomTestCase):
         return model.to(dtype).eval()
 
     @torch.inference_mode()
+    def test_compiled_rms_preserves_reduction_and_fake_tensor_contract(self):
+        """Keep RMS reduction opaque without changing dtype, axis, or tensor ownership."""
+        from sglang.multimodal_gen.runtime.models.dits.cosmos_pwm_wam.execution import (
+            _rms_mean_lastdim,
+        )
+
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        torch.manual_seed(1214)
+        graphs = []
+
+        def record_graph(graph, inputs):
+            graphs.append(graph)
+            # Execute the real custom op on CPU, not a mock of its implementation.
+            return graph.forward
+
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = (
+                torch.randn(5, 16, dtype=dtype),
+                torch.randn(2, 5, 16, dtype=dtype),
+                torch.randn(16, 5, dtype=dtype).T,
+                torch.randn(16, 2, 5, dtype=dtype).permute(1, 2, 0),
+            )
+            norm = PwmRMSNorm(16).to(dtype).eval()
+            norm.weight.copy_(torch.linspace(0.5, 1.5, 16, dtype=dtype))
+            compiled = torch.compile(
+                norm, backend=record_graph, fullgraph=True, dynamic=True
+            )
+            for value in inputs:
+                with self.subTest(
+                    dtype=dtype, shape=value.shape, stride=value.stride()
+                ):
+                    before = value.clone()
+                    expected = norm(value)
+                    actual = compiled(value)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    self.assertEqual(actual.dtype, dtype)
+                    self.assertEqual(actual.shape, value.shape)
+                    self.assertNotEqual(actual.data_ptr(), value.data_ptr())
+
+                    # Both the fake kernel and dispatcher schema must describe
+                    # the original last-axis, keepdim reduction on strided input.
+                    mean = _rms_mean_lastdim(value)
+                    torch.testing.assert_close(
+                        mean, value.mean(-1, keepdim=True), atol=0, rtol=0
+                    )
+                    self.assertEqual(mean.shape, (*value.shape[:-1], 1))
+                    self.assertEqual(mean.dtype, dtype)
+                    self.assertNotEqual(mean.data_ptr(), value.data_ptr())
+                    torch.library.opcheck(
+                        _rms_mean_lastdim,
+                        (value,),
+                        test_utils=("test_schema", "test_faketensor"),
+                    )
+                    torch.testing.assert_close(value, before, atol=0, rtol=0)
+
+        self.assertTrue(graphs, "RMS bypassed compilation")
+        for graph in graphs:
+            means = [
+                node
+                for node in graph.graph.nodes
+                if node.op == "call_function"
+                and node.target == torch.ops.sglang.pwm_wam_rms_mean.default
+            ]
+            self.assertEqual(len(means), 1, "Compiled RMS lost its ATen mean boundary")
+            # BF16 normalization must still accumulate its squared values in FP32.
+            self.assertEqual(
+                means[0].args[0].meta["example_value"].dtype, torch.float32
+            )
+            self.assertEqual(means[0].meta["example_value"].dtype, torch.float32)
+
+    @torch.inference_mode()
     def test_request_und_cache_matches_uncached_cfg_branches(self):
         """UND-only prefill preserves every layer's pre-update KV for both CFG branches."""
         for dtype in (torch.float32, torch.bfloat16):
@@ -178,9 +250,11 @@ class TestPwmModelContracts(CustomTestCase):
         oracle = copy.deepcopy(model)
         saved = {name: value.clone() for name, value in model.state_dict().items()}
         graphs = []
+        policies = []
 
         def record_graph(graph, inputs, **options):
             graphs.append(graph)
+            policies.append(options["options"])
             return graph.forward
 
         # Exercise Dynamo's real fullgraph tracing on CPU; GPU Inductor/kernel
@@ -221,6 +295,11 @@ class TestPwmModelContracts(CustomTestCase):
                     denoising_traced = True
                 for observed, reference in zip(actual, expected):
                     torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+        for policy in policies:
+            # mm + residual -> addmm loses an intermediate BF16 rounding;
+            # enforce the same precision policy in executed prefill/gen graphs.
+            self.assertIs(policy["pattern_matcher"], False)
+            self.assertIs(policy["emulate_precision_casts"], True)
         self.assertEqual(tuple(model.state_dict()), tuple(saved))
         for name, value in model.state_dict().items():
             torch.testing.assert_close(value, saved[name], atol=0, rtol=0)
