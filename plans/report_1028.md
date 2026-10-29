@@ -2,6 +2,8 @@
 
 > 2026-10-29 最新状态：原生 FA3、动态 compile 和请求内 IEEE 精度策略已补齐。同软件栈/同 GPU/同请求的稳定态 C/S/S/C 测量中，runtime 从 Cosmos 2.299706 s 降到 SGLang 2.017423 s，延迟下降 12.27%；真实 Python worker（含 IPC）为 2.024113 s，对照 2.296959 s，下降约 11.88%。但同环境视频质量矩阵的 DROID 末帧未达到原固定 PSNR/SSIM 门槛，仍在定位，**整体目标尚未验收完成**。下文 10/28 的“完成”是历史阶段记录，不能代表新性能与质量验收已完成。
 
+> 后续定位：保留原ATen RMS mean、关闭改变BF16中间舍入的Inductor pattern rewrite后，诊断候选的DROID33帧已与同环境Cosmos FA3 eager逐像素一致，动作差异恢复到1.164e-10。正在落地并重跑六场景与性能；上述12.27%是修复前版本的历史数字，不能预先作为最终版本收益。
+
 已完成本轮单GPU/B1范围的原生WAM接入、正确性验证和两项保守优化。同环境Cosmos-vs-native六场景的动作及视频逐位一致，目标环境的缓存开关/三入口互比也逐位一致。UND缓存相对未缓存路径实测延迟下降 **3.15%**（原尺寸无视频decode）和 **13.14%**（带视频短请求），GPU模型权重减少 **1.159 GiB**。最终审查发现的Python参数静默忽略问题已修复并经真实worker验证；所有本任务服务和worker均已退出。
 
 原生接入与功能验证已完成：真实 checkpoint 由 SGLang worker 直接执行 UND、VIDEO、ACTION 三塔及联合 UniPC，Python、原生 action HTTP 和 Cosmos `/generate` 兼容入口均可交付动作及可选视频。

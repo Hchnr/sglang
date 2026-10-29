@@ -62,6 +62,14 @@
 - 证实不同编译历史的generation图源码归一化后相同，但归约autotune R0_BLOCK2048/4096不同，方差求和的浮点次序可不同。该证据不等于所有漂移已证明源自此kernel，也未见请求Tensor泄漏证据。完整缓存/行号见 `compile_autotune_diagnosis.{md,json}`。
 - 实际优化服务验证完成：native HTTP与Cosmos facade各4次off/on/on/off，共8请求的动作/normalized与视频均exact；实际worker为FA3+compile、两个FP32 TF32开关False。视频下载、删除/404、native400与facade422错误后恢复正常，两服务优雅退出、GPU1清空、输出store清理，证据 `serving_ieee/`。其数学路径为当前2f499实现，不能据此宣称后续新编译算子已通过同样验证。
 
+### 决策 D18：保留 BF16 中间舍入，再验收性能
+
+- mean-only 与 mean+SiLU 的 DROID 动作、normalized 和视频三数组逐元素相同；SiLU 编译屏障真实生效，但没有改善该案例，主尺寸候选测试还从2.14350 s变慢为2.19079 s，因此不引入该算子。该轮是单进程候选筛选，不替代正式对照。证据 `quality_mean_silu_candidate/`。
+- 定位到第二处编译数值变化：原始 `residual + linear(x)` 先产出 BF16 GEMM 结果，再进行残差加法；Inductor post-grad 的 mm+add→addmm 重写省掉该中间舍入。`emulate_precision_casts=True` 并不阻止这条重写；不能仅凭开启该选项宣称保留逐算子语义。
+- 诊断仅保留原 ATen mean 边界，再显式关闭 `pattern_matcher`。DROID 与同环境 Cosmos FA3 eager 的33帧视频恢复逐像素exact，physical最大绝对差恢复为1.164153218e-10，与native eager相同。保持原质量门槛，下一步落地最小修复、完整六场景及不同首次shape复核，并重测正式runtime/worker性能。证据 `quality_droid_no_patterns/`；旧12.27%性能数字不作为修复后版本的最终收益。
+- 原始质量语义参考使用同环境同FA3的Cosmos eager，性能对照继续启用Cosmos compile+FA3；同时披露该source compile自身的数值漂移，不通过修改其配置制造更慢的Baseline。
+- 候选artifact的部分 `command.json` 沿用父脚本的“No compile/model monkeypatch”描述，实际诊断有进程内替换RMSNorm/编译选项（SiLU轮还替换F.silu）。这是诊断而非生产执行；补充说明纠正范围，不覆盖历史原始数据。最终生产验证必须使用未替换的原生代码。
+
 ## 2026-10-28 16:43：开始实施
 
 - SGLang 起点：`990ee89877f668304761d7551d803ed6b93d1673`，分支 `pwm_infer`；只有先前生成的 `plans/plan.md` 未跟踪。
